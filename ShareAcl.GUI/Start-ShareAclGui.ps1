@@ -65,6 +65,14 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name PickPrincipal -Value {
     Show-PrincipalPicker -Title $Title
 }
 
+# Navigation context: outgoing pages set it, incoming pages consume it once.
+$Script:App | Add-Member -NotePropertyName NavContext -NotePropertyValue $null
+
+$Script:App | Add-Member -MemberType ScriptMethod -Name Navigate -Value {
+    param([string]$PageName)
+    Navigate-Page $PageName
+}
+
 # -----------------------------------------------------------------------------
 # DB layer
 # -----------------------------------------------------------------------------
@@ -224,6 +232,16 @@ function Show-PrincipalPicker {
     })
 
     [void]$win.ShowDialog()
+    
+    # Detach handlers so the closures don't keep the window alive
+    $ok.Add_Click({}) | Out-Null
+    $btn.Add_Click({}) | Out-Null
+    $txt.Add_KeyDown({}) | Out-Null
+
+    # Clear the grid so its ItemsSource doesn't pin a query result
+    $grd.ItemsSource = $null
+
+    $win = $null
     return $script:result
 }
 
@@ -245,7 +263,7 @@ function Navigate-Page {
     # Page code-behind gets the page object and the app state
     & $codePath -Page $page -App $Script:App
 
-    $Script:App.PageHost.Navigate($page)
+    $Script:App.PageHost.Content = $page
     Set-Status "Loaded $PageName"
 }
 
@@ -323,10 +341,39 @@ $window.FindName('CmbScan').Add_SelectionChanged({
 # Wire navigation
 $Script:App.NavButtons['NavFolder'].Add_Click({ Navigate-Page 'FolderView' })
 $Script:App.NavButtons['NavAccount'].Add_Click({ Navigate-Page 'AccountView' })
-# (others wired in v0.4 as they're built)
+$Script:App.NavButtons['NavFindings'].Add_Click({ Navigate-Page 'FindingsView' })
+# (others wired in v0.5 as they're built)
 
 # Close cleanly
-$window.Add_Closed({ Close-ShareAclDatabase })
+$window.Add_Closed({
+    try {
+        Close-ShareAclDatabase
+    } catch { }
+  
+    # Detach the current page so its controls are eligible for GC
+    if ($Script:App.PageHost) {
+        $Script:App.PageHost.Content = $null
+    }
+
+    # Clear the nav-button event handlers and references
+    foreach ($k in @($Script:App.NavButtons.Keys)) {
+        $Script:App.NavButtons[$k] = $null
+    }
+    $Script:App.NavButtons.Clear()
+
+    # Drop references on the App bag
+    $Script:App.Window     = $null
+    $Script:App.PageHost   = $null
+    $Script:App.StatusBar  = $null
+    $Script:App.DbInfo     = $null
+    $Script:App.NavContext = $null
+
+    # Force a collection cycle so finalisers run before the script exits
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
+
+})
 
 # Auto-open if a path was passed on the command line
 if ($Database) {

@@ -1,4 +1,12 @@
-== ShareAcl v0.3 ==
+== ShareAcl v0.4 - 2026-06-29 ==
+
+New features:
+- Added FindingsView page to show all findings and their associated folders and ACEs.
+
+Bug fixes:
+- Fixed crash when too many handles were open in the GUI by detaching event handlers and clearing the ItemsSource of the DataGrid when closing a page.
+
+== ShareAcl v0.3 - 2026-06-29 ==
 
 New features:
 - Added AccountView page to show all accounts and their associated folders and ACEs.

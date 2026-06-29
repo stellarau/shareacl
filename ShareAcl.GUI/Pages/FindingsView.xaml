@@ -1,0 +1,86 @@
+<Page xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Title="Findings" FontFamily="Segoe UI" FontSize="12">
+    <Page.Resources>
+        <Style TargetType="TextBlock" x:Key="SeverityBadge">
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="6,1"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+            <Setter Property="HorizontalAlignment" Value="Left"/>
+        </Style>
+    </Page.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Top bar -->
+        <Border Grid.Row="0" BorderBrush="#DDD" BorderThickness="0,0,0,1" Padding="0,0,0,8" Margin="0,0,0,8">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Findings catalogue" FontWeight="Bold" FontSize="14" VerticalAlignment="Center"/>
+                <Button   x:Name="BtnRefresh" Content="Refresh counts" Padding="10,4" Margin="14,0,0,0"/>
+                <TextBlock x:Name="TxtSummary" VerticalAlignment="Center" Margin="14,0,0,0" Foreground="#666"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Catalogue + detail split -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="320"/>
+                <ColumnDefinition Width="5"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Catalogue -->
+            <ListBox x:Name="LstFindings" Grid.Column="0"
+                     HorizontalContentAlignment="Stretch">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Margin="2,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Background="{Binding SeverityBrush}"
+                                    CornerRadius="2" Margin="0,0,8,0">
+                                <TextBlock Text="{Binding Severity}" Style="{StaticResource SeverityBadge}"/>
+                            </Border>
+                            <TextBlock Grid.Column="1" Text="{Binding Name}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Column="2" Text="{Binding CountDisplay}"
+                                       VerticalAlignment="Center" Margin="6,0,0,0"
+                                       FontWeight="Bold" Foreground="#444"/>
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" Background="#DDD"/>
+
+            <!-- Detail panel -->
+            <DockPanel Grid.Column="2" Margin="6,0,0,0">
+                <Border DockPanel.Dock="Top" Background="#F8F8F8" Padding="10" Margin="0,0,0,8"
+                        BorderBrush="#DDD" BorderThickness="1">
+                    <StackPanel>
+                        <TextBlock x:Name="TxtFindingName" FontSize="14" FontWeight="Bold"/>
+                        <TextBlock x:Name="TxtFindingDesc" TextWrapping="Wrap" Foreground="#444" Margin="0,4,0,0"/>
+                    </StackPanel>
+                </Border>
+
+                <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
+                    <Button x:Name="BtnOpenInFolder" Content="Open selected in Folder view" Padding="10,4" IsEnabled="False"/>
+                    <Button x:Name="BtnCopyPath"     Content="Copy path"                    Padding="10,4" Margin="6,0,0,0" IsEnabled="False"/>
+                    <Button x:Name="BtnExportCsv"    Content="Export CSV…"                  Padding="10,4" Margin="6,0,0,0" IsEnabled="False"/>
+                </StackPanel>
+
+                <DataGrid x:Name="GrdDetail" AutoGenerateColumns="True"
+                          IsReadOnly="True" SelectionMode="Single"
+                          CanUserAddRows="False" GridLinesVisibility="Horizontal"
+                          RowHeaderWidth="0"/>
+            </DockPanel>
+        </Grid>
+    </Grid>
+</Page>
