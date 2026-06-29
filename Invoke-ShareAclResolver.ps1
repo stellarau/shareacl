@@ -23,6 +23,35 @@ $sids = (Invoke-SqliteQuery -DataSource $Database -Query @"
     AND p.sid IS NULL
 "@).sid
 
+function Get-PrimaryGroupMembers {
+    <#
+        For domain-local groups whose membership is held in the primaryGroupID
+        attribute on users/computers (RIDs 513-517), Get-ADGroupMember can
+        silently under-report. This adds an LDAP-filter fallback.
+    #>
+    param([string]$GroupSid)
+
+    $rid = ($GroupSid -split '-')[-1]
+    if ($rid -notin '513','514','515','516','517') { return @() }
+
+    try {
+        Get-ADObject -LDAPFilter "(primaryGroupID=$rid)" `
+                     -Properties SamAccountName, objectClass, objectSID, Name `
+                     -ErrorAction Stop |
+            ForEach-Object {
+                # Match the shape Get-ADGroupMember returns
+                [pscustomobject]@{
+                    Name           = $_.Name
+                    SamAccountName = $_.SamAccountName
+                    objectClass    = $_.objectClass
+                    SID            = $_.objectSID
+                }
+            }
+    } catch {
+        @()
+    }
+}
+
 function Resolve-Sid {
     param([string]$Sid)
     $now = [DateTime]::UtcNow.ToString('o')
@@ -88,21 +117,52 @@ foreach ($g in $groups) {
         $cur = $queue.Dequeue()
         if (-not $visited.Add($cur.sid)) { continue }   # cycle guard
         if ($cur.depth -ge $MaxNestingDepth) { continue }
+        
+        $members = @()
+            try {
+                $members += Get-ADGroupMember -Identity $cur.sid -ErrorAction Stop
+            } catch { }
+            $members += Get-PrimaryGroupMembers -GroupSid $cur.sid
 
-        try {
-            $members = Get-ADGroupMember -Identity $cur.sid -ErrorAction Stop
-        } catch { continue }
+            # De-duplicate by SID in case both calls return the same account
+            $members = $members | Group-Object { $_.SID.Value } | ForEach-Object { $_.Group[0] }
+
 
         foreach ($m in $members) {
             $memberSid = $m.SID.Value
-            $depth = $cur.depth + 1
+            $depth     = $cur.depth + 1
+
+            $memberType = switch ($m.objectClass) {
+                'user'                    { 'User' }
+                'group'                   { 'Group' }
+                'computer'                { 'Computer' }
+                'foreignSecurityPrincipal'{ 'ForeignSecurityPrincipal' }
+                default                   { 'Unknown' }
+            }
+
+            # Make sure this member is searchable in the principal picker.
+            # ON CONFLICT DO NOTHING preserves whatever the earlier classification pass found.
             Invoke-SqliteQuery -DataSource $Database -Query @"
-                INSERT OR IGNORE INTO group_members(group_sid,member_sid,depth)
-                VALUES (@g,@m,@d)
-"@ -SqlParameters @{ g=$g; m=$memberSid; d=$depth } | Out-Null
+                INSERT INTO principals(sid, name, domain, sam_account_name,
+                                    principal_type, is_well_known, last_resolved_utc)
+                VALUES (@sid, @name, @domain, @sam, @type, 0, @now)
+                ON CONFLICT(sid) DO NOTHING
+"@ -SqlParameters @{
+                sid    = $memberSid
+                name   = $m.Name
+                domain = $env:USERDOMAIN
+                sam    = $m.SamAccountName
+                type   = $memberType
+                now    = [System.DateTime]::UtcNow.ToString('o')
+            } | Out-Null
+
+            Invoke-SqliteQuery -DataSource $Database -Query @"
+                INSERT OR IGNORE INTO group_members(group_sid, member_sid, depth)
+                VALUES (@g, @m, @d)
+"@ -SqlParameters @{ g = $g; m = $memberSid; d = $depth } | Out-Null
 
             if ($m.objectClass -eq 'group') {
-                $queue.Enqueue(@{ sid=$memberSid; depth=$depth })
+                $queue.Enqueue(@{ sid = $memberSid; depth = $depth })
             }
         }
     }

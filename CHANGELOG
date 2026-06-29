@@ -1,0 +1,11 @@
+== ShareAcl v0.3 ==
+
+New features:
+- Added AccountView page to show all accounts and their associated folders and ACEs.
+
+Improvements:
+- Added indexing to the database schema for efficient lookup of ACEs by trustee and folder.
+- Added indexing to the database schema for efficient lookup of ACEs by rights mask and access control type.
+
+Bug fixes:
+- Fixed issue with group membership resolution in Invoke-ShareAclResolver.ps1 to include primary group members and de-duplicate results by SID.

@@ -60,6 +60,11 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name ShowError -Value {
     $this.StatusBar.Text = $Message
 }
 
+$Script:App | Add-Member -MemberType ScriptMethod -Name PickPrincipal -Value {
+    param([string]$Title = 'Pick a principal')
+    Show-PrincipalPicker -Title $Title
+}
+
 # -----------------------------------------------------------------------------
 # DB layer
 # -----------------------------------------------------------------------------
@@ -317,7 +322,8 @@ $window.FindName('CmbScan').Add_SelectionChanged({
 
 # Wire navigation
 $Script:App.NavButtons['NavFolder'].Add_Click({ Navigate-Page 'FolderView' })
-# (others wired in v0.2 as they're built)
+$Script:App.NavButtons['NavAccount'].Add_Click({ Navigate-Page 'AccountView' })
+# (others wired in v0.4 as they're built)
 
 # Close cleanly
 $window.Add_Closed({ Close-ShareAclDatabase })

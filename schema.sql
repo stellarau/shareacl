@@ -1,4 +1,4 @@
--- ShareACL schema v0.1
+-- ShareACL schema v0.2
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
@@ -91,3 +91,10 @@ CREATE TABLE IF NOT EXISTS scan_errors (
     logged_utc  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_errors_scan ON scan_errors(scan_id);
+
+-- Index for efficient lookup of ACEs by trustee and folder
+CREATE INDEX IF NOT EXISTS ix_aces_trustee_folder ON aces(trustee_sid, folder_id);
+
+-- Index for efficient lookup of ACEs by rights mask and access control type
+CREATE INDEX IF NOT EXISTS ix_aces_rights_mask ON aces(rights_mask);
+CREATE INDEX IF NOT EXISTS ix_aces_act_inherited ON aces(access_control_type, is_inherited);
