@@ -1,3 +1,19 @@
+== ShareAcl v0.5 - 2026-07-01 ==
+
+New features:
+- Added SwapView page to allow swapping one trustee for another in a given scope. Target trustees are persisted in the database for future use.
+- Allowed the GUI to be used without a scan selected, for live operations on the current ACLs of the system. In this mode, only the SwapView page is available.
+- Added new launcher script Start-ShareAcl.ps1 as a bulletproof way to dispose of handles by running the GUI in a separate process. This is the recommended way to launch the GUI, especially when running multiple instances.
+
+Futureproofing:
+- Modified schema to store audit log entries for ACE changes, including the original ACEs and the new ACEs, to support future auditing capabilities.
+
+Cleanup:
+- Replaced built-in $args variable with a more descriptive $sqlArgs variable in Start-ShareAclGui.ps1 to avoid potential conflicts with other scripts.
+
+Bug fixes:
+- Additional crash fixes in the GUI when too many handles were open, by running additional cleanup at startup, Show-PrincipalPicker, and SwapView page unload.
+
 == ShareAcl v0.4 - 2026-06-29 ==
 
 New features:

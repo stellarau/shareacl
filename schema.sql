@@ -98,3 +98,34 @@ CREATE INDEX IF NOT EXISTS ix_aces_trustee_folder ON aces(trustee_sid, folder_id
 -- Index for efficient lookup of ACEs by rights mask and access control type
 CREATE INDEX IF NOT EXISTS ix_aces_rights_mask ON aces(rights_mask);
 CREATE INDEX IF NOT EXISTS ix_aces_act_inherited ON aces(access_control_type, is_inherited);
+
+-- Append-only journal of swap operations
+CREATE TABLE IF NOT EXISTS swap_runs (
+    run_id          TEXT PRIMARY KEY,
+    started_utc     TEXT NOT NULL,
+    completed_utc   TEXT,
+    operator        TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    source_sid      TEXT NOT NULL,
+    source_name     TEXT,
+    target_sid      TEXT NOT NULL,
+    target_name     TEXT,
+    scope_root      TEXT NOT NULL,
+    based_on_scan   INTEGER REFERENCES scans(scan_id),     -- nullable: live discovery has no scan
+    discovery_mode  TEXT NOT NULL CHECK (discovery_mode IN ('scan','live')),
+    folder_count    INTEGER NOT NULL DEFAULT 0,
+    ok_count        INTEGER NOT NULL DEFAULT 0,
+    fail_count      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS swap_results (
+    result_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     TEXT NOT NULL REFERENCES swap_runs(run_id),
+    path       TEXT NOT NULL,
+    result     TEXT NOT NULL CHECK (result IN ('ok','fail','skip','noop')),
+    detail     TEXT,
+    when_utc   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_swap_results_run ON swap_results(run_id);
+CREATE INDEX IF NOT EXISTS ix_swap_runs_source ON swap_runs(source_sid);
+CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);

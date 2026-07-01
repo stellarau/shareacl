@@ -16,6 +16,32 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
+# Pre-run cleanup: eagerly release any state left over from a previous run
+# in the same PowerShell session. Idempotent — safe on the first run too.
+if ($Script:App) {
+    try {
+        if ($Script:App.PageHost) { $Script:App.PageHost.Content = $null }
+    } catch { }
+    try {
+        if ($Script:App.Connection) {
+            try { $Script:App.Connection.Close() }   catch { }
+            try { $Script:App.Connection.Dispose() } catch { }
+        }
+    } catch { }
+    try {
+        if ($Script:App.Window) {
+            $Script:App.Window.Owner = $null
+            $Script:App.Window.Close()
+        }
+    } catch { }
+    if ($Script:App.NavButtons) { $Script:App.NavButtons.Clear() }
+    $Script:App = $null
+}
+try { [System.Data.SQLite.SQLiteConnection]::ClearAllPools() } catch { }
+[System.GC]::Collect()
+[System.GC]::WaitForPendingFinalizers()
+[System.GC]::Collect()
+
 # -----------------------------------------------------------------------------
 # Shared constants (defined once to dodge the [Type]::Member rendering trap)
 # -----------------------------------------------------------------------------
@@ -61,8 +87,11 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name ShowError -Value {
 }
 
 $Script:App | Add-Member -MemberType ScriptMethod -Name PickPrincipal -Value {
-    param([string]$Title = 'Pick a principal')
-    Show-PrincipalPicker -Title $Title
+    param(
+        [string] $Title         = 'Pick a principal',
+        [string] $DefaultSource = 'Database'
+    )
+    Show-PrincipalPicker -Title $Title -DefaultSource $DefaultSource
 }
 
 # Navigation context: outgoing pages set it, incoming pages consume it once.
@@ -87,6 +116,38 @@ function Open-ShareAclDatabase {
         WHERE type='table' AND name IN ('scans','folders','aces','principals','group_members')
 "@
     if ($check.n -lt 5) { throw "Not a ShareACL database (missing core tables): $Path" }
+
+    #Migration: ensure swap journal tables exist (additive, idempotent)
+        Invoke-SqliteQuery -DataSource $Path -Query @"
+            CREATE TABLE IF NOT EXISTS swap_runs (
+                run_id TEXT PRIMARY KEY,
+                started_utc TEXT NOT NULL,
+                completed_utc TEXT,
+                operator TEXT NOT NULL,
+                host TEXT NOT NULL,
+                source_sid TEXT NOT NULL,
+                source_name TEXT,
+                target_sid TEXT NOT NULL,
+                target_name TEXT,
+                scope_root TEXT NOT NULL,
+                based_on_scan INTEGER REFERENCES scans(scan_id),
+                discovery_mode TEXT NOT NULL CHECK (discovery_mode IN ('scan','live')),
+                folder_count INTEGER NOT NULL DEFAULT 0,
+                ok_count INTEGER NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS swap_results (
+                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES swap_runs(run_id),
+                path TEXT NOT NULL,
+                result TEXT NOT NULL CHECK (result IN ('ok','fail','skip','noop')),
+                detail TEXT,
+                when_utc TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_swap_results_run ON swap_results(run_id);
+            CREATE INDEX IF NOT EXISTS ix_swap_runs_source ON swap_runs(source_sid);
+            CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);
+"@ | Out-Null
 
     Close-ShareAclDatabase
 
@@ -118,12 +179,12 @@ function Invoke-AppQuery {
     )
     if (-not $Script:App.Connection) { throw "No database open." }
 
-    $args = @{
+    $sqlArgs = @{
         SQLiteConnection = $Script:App.Connection
         Query            = $Query
     }
-    if ($SqlParameters) { $args.SqlParameters = $SqlParameters }
-    Invoke-SqliteQuery @args
+    if ($SqlParameters) { $sqlArgs.SqlParameters = $SqlParameters }
+    Invoke-SqliteQuery @sqlArgs
 }
 
 # -----------------------------------------------------------------------------
@@ -153,30 +214,43 @@ function Get-ScanList {
 
 function Refresh-ScanCombo {
     $cmb = $Script:App.Window.FindName('CmbScan')
-    $cmb.ItemsSource = @(Get-ScanList)
-    if ($cmb.Items.Count -gt 0) {
-        $cmb.SelectedIndex = 0   # newest first
-    }
+    $list = @([pscustomobject]@{ ScanId = $null; Display = '(none — no scan selected)' })
+    $list += @(Get-ScanList)
+    $cmb.ItemsSource = $list
+    # Auto-select the newest real scan if present; otherwise the "none" row
+    if ($list.Count -gt 1) { $cmb.SelectedIndex = 1 } else { $cmb.SelectedIndex = 0 }
 }
 
 # -----------------------------------------------------------------------------
 # Principal picker (shared dialog used by Account view and Swap workflow)
 # -----------------------------------------------------------------------------
 function Show-PrincipalPicker {
-    <#  Returns a hashtable @{ Sid; Name; Type } or $null if cancelled.
-        Searches the principals table by name fragment. #>
-    param([string]$Title = 'Pick a principal')
+    param(
+        [string] $Title = 'Pick a principal',
+        [ValidateSet('Database','ActiveDirectory')]
+        [string] $DefaultSource = 'Database'
+    )
 
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="$Title" Height="500" Width="600"
+        Title="$Title" Height="520" Width="640"
         WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="12">
     <DockPanel Margin="10">
-        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
-            <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
-            <TextBox x:Name="TxtSearch" Width="400"/>
-            <Button x:Name="BtnSearch" Content="Search" Margin="6,0,0,0" Padding="10,2"/>
+        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="Search in:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <RadioButton x:Name="RbDb" Content="Database (resolved principals)"
+                             VerticalAlignment="Center" Margin="0,0,12,0"/>
+                <RadioButton x:Name="RbAd" Content="Active Directory (live query)"
+                             VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBox x:Name="TxtSearch" Width="400"/>
+                <Button x:Name="BtnSearch" Content="Search" Margin="6,0,0,0" Padding="10,2"/>
+                <TextBlock x:Name="TxtSearchStatus" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="#666"/>
+            </StackPanel>
         </StackPanel>
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
             <Button x:Name="BtnOk"     Content="OK"     IsDefault="True"  Width="80" Margin="0,0,6,0"/>
@@ -199,31 +273,78 @@ function Show-PrincipalPicker {
     $win    = [System.Windows.Markup.XamlReader]::Load($reader)
     $win.Owner = $Script:App.Window
 
-    $txt = $win.FindName('TxtSearch')
-    $grd = $win.FindName('GrdResults')
-    $ok  = $win.FindName('BtnOk')
-    $btn = $win.FindName('BtnSearch')
+    $rbDb         = $win.FindName('RbDb')
+    $rbAd         = $win.FindName('RbAd')
+    $txt          = $win.FindName('TxtSearch')
+    $grd          = $win.FindName('GrdResults')
+    $ok           = $win.FindName('BtnOk')
+    $btn          = $win.FindName('BtnSearch')
+    $searchStatus = $win.FindName('TxtSearchStatus')
+
+    if ($DefaultSource -eq 'ActiveDirectory') { $rbAd.IsChecked = $true }
+    else                                       { $rbDb.IsChecked = $true }
 
     $doSearch = {
         $q = $txt.Text.Trim()
-        if (-not $q) { $grd.ItemsSource = @(); return }
-        $rows = Invoke-AppQuery -Query @"
-            SELECT sid AS Sid, name AS Name, sam_account_name AS Sam, principal_type AS Type
-            FROM principals
-            WHERE name LIKE @q OR sam_account_name LIKE @q OR sid = @exact
-            ORDER BY name LIMIT 200
+        if (-not $q) { $grd.ItemsSource = @(); $searchStatus.Text = ''; return }
+
+        if ($rbAd.IsChecked) {
+            try {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                $escaped = $q -replace '([\\*\(\)\0])', '\$1'
+                $filter  = "(&(|(objectClass=user)(objectClass=group)(objectClass=computer))" +
+                           "(|(sAMAccountName=*$escaped*)(name=*$escaped*)))"
+                $results = Get-ADObject -LDAPFilter $filter `
+                              -Properties sAMAccountName, objectClass, objectSID, Name `
+                              -ResultSetSize 200 -ErrorAction Stop
+                $rows = $results | ForEach-Object {
+                    $type = switch ($_.objectClass) {
+                        'user'     { 'User' }
+                        'group'    { 'Group' }
+                        'computer' { 'Computer' }
+                        default    { 'Unknown' }
+                    }
+                    [pscustomobject]@{
+                        Sid  = $_.objectSID.Value
+                        Name = $_.Name
+                        Sam  = $_.sAMAccountName
+                        Type = $type
+                    }
+                }
+                $grd.ItemsSource = @($rows)
+                $searchStatus.Text = "AD: $(@($rows).Count) result(s)"
+            } catch {
+                $grd.ItemsSource = @()
+                $searchStatus.Text = "AD search failed: $($_.Exception.Message)"
+            }
+        } else {
+            try {
+                $rows = Invoke-AppQuery -Query @"
+                    SELECT sid AS Sid, name AS Name, sam_account_name AS Sam, principal_type AS Type
+                    FROM principals
+                    WHERE name LIKE @q OR sam_account_name LIKE @q OR sid = @exact
+                    ORDER BY name LIMIT 200
 "@ -SqlParameters @{ q = "%$q%"; exact = $q }
-        $grd.ItemsSource = @($rows)
+                $grd.ItemsSource = @($rows)
+                $searchStatus.Text = "DB: $(@($rows).Count) result(s)"
+            } catch {
+                $grd.ItemsSource = @()
+                $searchStatus.Text = "DB search failed: $($_.Exception.Message)"
+            }
+        }
     }
     $btn.Add_Click($doSearch)
     $txt.Add_KeyDown({ if ($_.Key -eq 'Return') { & $doSearch } })
+    $rbDb.Add_Click({ if ($txt.Text.Trim()) { & $doSearch } })
+    $rbAd.Add_Click({ if ($txt.Text.Trim()) { & $doSearch } })
 
-    $result = $null
+    $script:result = $null
     $ok.Add_Click({
         if ($grd.SelectedItem) {
             $script:result = @{
                 Sid  = $grd.SelectedItem.Sid
                 Name = $grd.SelectedItem.Name
+                Sam  = $grd.SelectedItem.Sam
                 Type = $grd.SelectedItem.Type
             }
             $win.DialogResult = $true
@@ -232,17 +353,18 @@ function Show-PrincipalPicker {
     })
 
     [void]$win.ShowDialog()
-    
-    # Detach handlers so the closures don't keep the window alive
-    $ok.Add_Click({}) | Out-Null
-    $btn.Add_Click({}) | Out-Null
-    $txt.Add_KeyDown({}) | Out-Null
 
-    # Clear the grid so its ItemsSource doesn't pin a query result
-    $grd.ItemsSource = $null
-
+    # Release control references and event handlers so the window is fully collectible
+    try {
+        $grd.ItemsSource = $null
+        $win.Owner       = $null
+        $win.Content     = $null
+    } catch { }
     $win = $null
-    return $script:result
+
+    $captured = $script:result
+    $script:result = $null
+    return $captured
 }
 
 # -----------------------------------------------------------------------------
@@ -332,9 +454,21 @@ $window.FindName('BtnRefreshScans').Add_Click({ Refresh-ScanCombo })
 
 $window.FindName('CmbScan').Add_SelectionChanged({
     $sel = $window.FindName('CmbScan').SelectedItem
-    if ($sel) {
-        $Script:App.CurrentScanId = [int]$sel.ScanId
+    if (-not $sel) { return }
+    $Script:App.CurrentScanId = $sel.ScanId   # may be $null
+    
+    $hasScan = ($null -ne $sel.ScanId)
+    foreach ($name in 'NavFolder','NavAccount','NavFindings') {
+        $btn = $Script:App.NavButtons[$name]
+        if ($btn) { $btn.IsEnabled = $hasScan }
+    }
+    # NavSwap stays enabled regardless — it works in live mode without a scan.
+    # NavCollect stays enabled regardless once it's wired (future iteration).
+
+    if ($hasScan) {
         Set-Status "Active scan: #$($Script:App.CurrentScanId)"
+    } else {
+        Set-Status "No scan selected (Swap available in live mode only)."
     }
 })
 
@@ -342,7 +476,8 @@ $window.FindName('CmbScan').Add_SelectionChanged({
 $Script:App.NavButtons['NavFolder'].Add_Click({ Navigate-Page 'FolderView' })
 $Script:App.NavButtons['NavAccount'].Add_Click({ Navigate-Page 'AccountView' })
 $Script:App.NavButtons['NavFindings'].Add_Click({ Navigate-Page 'FindingsView' })
-# (others wired in v0.5 as they're built)
+$Script:App.NavButtons['NavSwap'].Add_Click({ Navigate-Page 'SwapView' })
+# (others wired in v0.6 as they're built)
 
 # Close cleanly
 $window.Add_Closed({
@@ -390,4 +525,14 @@ if ($Database) {
 }
 
 Set-NavEnabled $false   # locked until a DB is open
+
+# Warn (not block) if not elevated. Some operations work fine without elevation
+# (e.g., where the user has Modify on the share); others need it.
+$ident = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$princ = [System.Security.Principal.WindowsPrincipal]::new($ident)
+if (-not $princ.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $Script:App.StatusBar.Text =
+        "Running non-elevated. ACL writes will only succeed where your user has direct rights."
+}
+
 [void]$window.ShowDialog()
