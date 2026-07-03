@@ -368,6 +368,345 @@ function Show-PrincipalPicker {
 }
 
 # -----------------------------------------------------------------------------
+# New scan dialog (modal window)
+# -----------------------------------------------------------------------------
+
+function Show-NewScanDialog {
+    if (-not $Script:App.DbPath -or -not $Script:App.Connection) {
+        [System.Windows.MessageBox]::Show('Open a database first.', 'New scan', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    
+    # Capture App reference locally so closures can rely on it.
+    # $Script: scope doesn't survive .GetNewClosure() across event handlers.
+    $app = $Script:App
+
+
+    $xamlPath = Join-Path $Script:PagesRoot 'NewScanDialog.xaml'
+    if (-not (Test-Path $xamlPath)) { throw "Dialog XAML missing: $xamlPath" }
+
+    $reader = [System.Xml.XmlReader]::Create($xamlPath)
+    $win    = [System.Windows.Markup.XamlReader]::Load($reader)
+    $win.Owner = $Script:App.Window
+
+    $txtRoots      = $win.FindName('TxtRoots')
+    $txtBatch      = $win.FindName('TxtBatchSize')
+    $txtDepth      = $win.FindName('TxtMaxDepth')
+    $chkResolver   = $win.FindName('ChkRunResolver')
+    $chkCheckpoint = $win.FindName('ChkCheckpoint')
+    $btnBrowse     = $win.FindName('BtnBrowsePath')
+    $btnPrefill    = $win.FindName('BtnPrefillPrev')
+    $btnStart      = $win.FindName('BtnStart')
+    $btnCancel     = $win.FindName('BtnCancel')
+    $btnClose      = $win.FindName('BtnClose')
+    $txtOutput     = $win.FindName('TxtOutput')
+    $txtStatus     = $win.FindName('TxtStatus')
+
+    $collectorPath = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\Invoke-ShareAclCollector.ps1'))
+    $resolverPath  = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\Invoke-ShareAclResolver.ps1'))
+
+    foreach ($p in @($collectorPath, $resolverPath)) {
+        if (-not (Test-Path $p)) {
+            [System.Windows.MessageBox]::Show($win, "Required script missing:`n$p",
+                'New scan', 'OK', 'Error') | Out-Null
+            $win.Close(); return
+        }
+    }
+
+    # Cross-thread output queue — threadpool writers, UI-thread reader
+    $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+    # Dialog state
+    $dlgState = @{
+        Proc          = $null
+        Phase         = 'idle'      # idle | collecting | resolving | done | cancelled
+        RunResolver   = $false
+        OnExit        = $null       # scriptblock invoked on UI thread when process exits
+        StdoutRegId   = $null       # event subscription IDs for cleanup
+        StderrRegId   = $null
+    }
+
+    # --- UI-thread helpers (no dispatcher marshalling needed) ---
+
+    $drainQueue = {
+        $line = $null
+        while ($outputQueue.TryDequeue([ref]$line)) {
+            $txtOutput.AppendText($line + "`r`n")
+        }
+        $txtOutput.ScrollToEnd()
+    }.GetNewClosure()
+
+    $appendLine = {
+        param([string]$Line)
+        if ($null -eq $Line) { return }
+        $txtOutput.AppendText($Line + "`r`n")
+        $txtOutput.ScrollToEnd()
+    }.GetNewClosure()
+
+    $setStatus = {
+        param([string]$Text)
+        $txtStatus.Text = $Text
+    }.GetNewClosure()
+
+    $setRunningUi = {
+        param([bool]$Running)
+        $btnStart.IsEnabled      = -not $Running
+        $btnCancel.IsEnabled     =      $Running
+        $btnClose.IsEnabled      = -not $Running
+        $txtRoots.IsEnabled      = -not $Running
+        $txtBatch.IsEnabled      = -not $Running
+        $txtDepth.IsEnabled      = -not $Running
+        $chkResolver.IsEnabled   = -not $Running
+        $chkCheckpoint.IsEnabled = -not $Running
+        $btnBrowse.IsEnabled     = -not $Running
+        $btnPrefill.IsEnabled    = -not $Running
+    }.GetNewClosure()
+
+    $checkpointDb = {
+        try {
+            Invoke-SqliteQuery -DataSource $app.DbPath `
+                -Query 'PRAGMA wal_checkpoint(TRUNCATE);' | Out-Null
+        } catch {
+            & $appendLine "Checkpoint failed: $($_.Exception.Message)"
+        }
+    }.GetNewClosure()
+
+    $encodeCommand = {
+        param([string]$Command)
+        [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))
+    }.GetNewClosure()
+
+    $onScanExit = {
+        param([int]$ExitCode)
+        $cancelled = ($dlgState.Phase -eq 'cancelled')
+        if ($cancelled) {
+            $dlgState.Phase = 'done'
+            & $setStatus 'Cancelled. Partial scan can be resumed via -Resume in a manual run.'
+            Refresh-ScanCombo
+            & $setRunningUi $false
+            return
+        }
+        if ($ExitCode -ne 0) {
+            $dlgState.Phase = 'done'
+            & $setStatus "Scan pipeline failed (exit $ExitCode). See output above."
+            Refresh-ScanCombo
+            & $setRunningUi $false
+            return
+        }
+        if ($chkCheckpoint.IsChecked) {
+            & $setStatus 'Checkpointing database…'
+            & $checkpointDb
+        }
+        $dlgState.Phase = 'done'
+        & $setStatus 'Complete.'
+        Refresh-ScanCombo
+        & $setRunningUi $false
+    }.GetNewClosure()
+
+    # --- DispatcherTimer: drains output and polls process exit on the UI thread ---
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(100)
+    $timer.Add_Tick({
+        & $drainQueue
+        if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
+            $timer.Stop()
+
+            # Unregister event subscriptions so they don't leak across runs
+            if ($dlgState.StdoutRegId) {
+                try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
+                $dlgState.StdoutRegId = $null
+            }
+            if ($dlgState.StderrRegId) {
+                try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
+                $dlgState.StderrRegId = $null
+            }
+            
+            $exitCode = $dlgState.Proc.ExitCode
+            Start-Sleep -Milliseconds 100
+            & $drainQueue
+
+            & $onScanExit $exitCode
+        }
+    }.GetNewClosure())
+
+    # --- Start button ---
+    $btnStart.Add_Click({
+        $paths = @($txtRoots.Text -split "`r?`n" |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ })
+        if ($paths.Count -eq 0) {
+            [System.Windows.MessageBox]::Show($win, 'Provide at least one root path.',
+                'New scan', 'OK', 'Warning') | Out-Null
+            return
+        }
+
+        $batchSize = 500
+        if (-not [int]::TryParse($txtBatch.Text.Trim(), [ref]$batchSize) -or $batchSize -lt 1) {
+            [System.Windows.MessageBox]::Show($win, 'Batch size must be a positive integer.',
+                'New scan', 'OK', 'Warning') | Out-Null
+            return
+        }
+
+        $maxDepth = 0
+        if ($txtDepth.Text.Trim()) {
+            if (-not [int]::TryParse($txtDepth.Text.Trim(), [ref]$maxDepth) -or $maxDepth -lt 1) {
+                [System.Windows.MessageBox]::Show($win, 'Max depth must be blank or a positive integer.',
+                    'New scan', 'OK', 'Warning') | Out-Null
+                return
+            }
+        }
+
+        $runResolver = [bool]$chkResolver.IsChecked
+        $dlgState.Phase = 'collecting'
+
+        $txtOutput.Clear()
+        & $setRunningUi $true
+        & $setStatus 'Running scan pipeline…'
+
+        # Escape single quotes for embedding in single-quoted strings inside the composite
+        $q = "'"
+        $rootsLiteral = ($paths | ForEach-Object { "$q" + $_.Replace($q, "$q$q") + "$q" }) -join ','
+        $dbEsc        = $app.DbPath.Replace($q, "$q$q")
+        $collectorEsc = $collectorPath.Replace($q, "$q$q")
+        $resolverEsc  = $resolverPath.Replace($q, "$q$q")
+        $depthArg     = if ($maxDepth -gt 0) { " -MaxDepth $maxDepth" } else { '' }
+
+        # Compose the child script. Single-quoted lines have no interpolation from PS7-outer;
+        # double-quoted lines interpolate outer variables. `$` inside strings we want the child
+        # to see literally is escaped with a backtick.
+        $lines = @()
+        $lines += '$ErrorActionPreference = ''Continue'''
+        $lines += "Write-Host '===== COLLECTOR STARTED ====='"
+        $lines += 'try {'
+        $lines += "    & '$collectorEsc' -RootPath @($rootsLiteral) -Database '$dbEsc' -BatchSize $batchSize$depthArg"
+        $lines += '    $collectorExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }'
+        $lines += '} catch {'
+        $lines += '    Write-Host "Collector threw: $($_.Exception.Message)"'
+        $lines += '    $collectorExit = 1'
+        $lines += '}'
+        $lines += 'Write-Host "===== COLLECTOR EXITED (code $collectorExit) ====="'
+        if ($runResolver) {
+            $lines += 'if ($collectorExit -eq 0) {'
+            $lines += "    Write-Host ''"
+            $lines += "    Write-Host '===== RESOLVER STARTED ====='"
+            $lines += '    try {'
+            $lines += "        & '$resolverEsc' -Database '$dbEsc'"
+            $lines += '        $resolverExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }'
+            $lines += '    } catch {'
+            $lines += '        Write-Host "Resolver threw: $($_.Exception.Message)"'
+            $lines += '        $resolverExit = 2'
+            $lines += '    }'
+            $lines += '    Write-Host "===== RESOLVER EXITED (code $resolverExit) ====="'
+            $lines += '    exit $resolverExit'
+            $lines += '} else {'
+            $lines += "    Write-Host 'Skipping resolver (collector did not succeed).'"
+            $lines += '}'
+        }
+        $lines += 'exit $collectorExit'
+        $childScript = $lines -join "`r`n"
+
+        # Encode and launch
+        $encoded = & $encodeCommand $childScript
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = 'pwsh'
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        [void]$psi.ArgumentList.Add('-NoProfile')
+        [void]$psi.ArgumentList.Add('-NonInteractive')
+        [void]$psi.ArgumentList.Add('-EncodedCommand')
+        [void]$psi.ArgumentList.Add($encoded)
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+
+        $stdoutReg = Register-ObjectEvent -InputObject $proc `
+            -EventName OutputDataReceived `
+            -MessageData $outputQueue `
+            -Action {
+                if ($EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) }
+            }
+        $stderrReg = Register-ObjectEvent -InputObject $proc `
+            -EventName ErrorDataReceived `
+            -MessageData $outputQueue `
+            -Action {
+                if ($EventArgs.Data) { $Event.MessageData.Enqueue("STDERR: $($EventArgs.Data)") }
+            }
+
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        $dlgState.Proc        = $proc
+        $dlgState.StdoutRegId = $stdoutReg.Id
+        $dlgState.StderrRegId = $stderrReg.Id
+        $timer.Start()
+    }.GetNewClosure())
+
+    $btnCancel.Add_Click({
+        if ($dlgState.Proc -and -not $dlgState.Proc.HasExited) {
+            $dlgState.Phase = 'cancelled'
+            & $setStatus 'Cancelling…'
+            try { $dlgState.Proc.Kill() } catch { }
+        }
+    }.GetNewClosure())
+
+    $btnBrowse.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            if ($txtRoots.Text.TrimEnd() -ne '') { $txtRoots.AppendText("`r`n") }
+            $txtRoots.AppendText($dlg.SelectedPath)
+        }
+    }.GetNewClosure())
+
+    $btnPrefill.Add_Click({
+        try {
+            $row = Invoke-SqliteQuery -SQLiteConnection $app.Connection `
+                -Query 'SELECT root_paths_json FROM scans ORDER BY scan_id DESC LIMIT 1'
+            if (-not $row) {
+                $txtStatus.Text = 'No previous scan found in this database.'
+                return
+            }
+            $json = [string]$row.root_paths_json
+            if ([string]::IsNullOrWhiteSpace($json)) {
+                $txtStatus.Text = 'Previous scan has no recorded root paths.'
+                return
+            }
+            $roots = @($json | ConvertFrom-Json)
+            if ($roots.Count -eq 0) {
+                $txtStatus.Text = 'Previous scan has no recorded root paths.'
+                return
+            }
+            $txtRoots.Text = ($roots -join "`r`n")
+            $txtStatus.Text = "Prefilled $($roots.Count) root path(s) from most recent scan."
+        } catch {
+            $txtStatus.Text = "Prefill failed: $($_.Exception.Message)"
+        }
+    }.GetNewClosure())
+
+    $win.Add_Closed({
+        try { $timer.Stop() } catch { }
+        if ($dlgState.StdoutRegId) {
+            try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
+        }
+        if ($dlgState.StderrRegId) {
+            try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
+        }
+        try {
+            if ($dlgState.Proc -and -not $dlgState.Proc.HasExited) {
+                try { $dlgState.Proc.Kill() } catch { }
+            }
+            if ($dlgState.Proc) { try { $dlgState.Proc.Dispose() } catch { } }
+        } catch { }
+    }.GetNewClosure())
+
+    [void]$win.ShowDialog()
+}
+
+# -----------------------------------------------------------------------------
 # Page navigation
 # -----------------------------------------------------------------------------
 function Navigate-Page {
@@ -477,7 +816,7 @@ $Script:App.NavButtons['NavFolder'].Add_Click({ Navigate-Page 'FolderView' })
 $Script:App.NavButtons['NavAccount'].Add_Click({ Navigate-Page 'AccountView' })
 $Script:App.NavButtons['NavFindings'].Add_Click({ Navigate-Page 'FindingsView' })
 $Script:App.NavButtons['NavSwap'].Add_Click({ Navigate-Page 'SwapView' })
-# (others wired in v0.6 as they're built)
+$Script:App.NavButtons['NavCollect'].Add_Click({ Show-NewScanDialog })
 
 # Close cleanly
 $window.Add_Closed({

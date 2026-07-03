@@ -1,0 +1,58 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New scan"
+        Height="640" Width="860"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="Segoe UI" FontSize="12">
+    <DockPanel Margin="10">
+
+        <!-- Bottom: buttons -->
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="BtnStart"  Content="Start scan"  Padding="16,6" FontWeight="Bold"/>
+            <Button x:Name="BtnCancel" Content="Cancel scan" Padding="16,6" Margin="6,0,0,0" IsEnabled="False"/>
+            <Button x:Name="BtnClose"  Content="Close"       Padding="16,6" Margin="6,0,0,0" IsCancel="True"/>
+        </StackPanel>
+
+        <!-- Top: inputs -->
+        <StackPanel DockPanel.Dock="Top">
+            <TextBlock Text="Root paths (one per line, UNC or local):" FontWeight="Bold"/>
+            <Grid Margin="0,4,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox Grid.Column="0" x:Name="TxtRoots" Height="90"
+                         AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                         FontFamily="Consolas"/>
+                <StackPanel Grid.Column="1" Margin="6,0,0,0" VerticalAlignment="Top">
+                    <Button x:Name="BtnBrowsePath"  Content="Add folder…" Padding="10,4" Width="110"/>
+                    <Button x:Name="BtnPrefillPrev" Content="Prefill last" Padding="10,4" Width="110" Margin="0,4,0,0"
+                            ToolTip="Populate with the root paths from the most recent scan in this database"/>
+                </StackPanel>
+            </Grid>
+
+            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <TextBlock Text="Batch size:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBox x:Name="TxtBatchSize" Width="60" Text="500" VerticalAlignment="Center"/>
+                <TextBlock Text="Max depth (blank = unlimited):" VerticalAlignment="Center" Margin="14,0,6,0"/>
+                <TextBox x:Name="TxtMaxDepth" Width="60" VerticalAlignment="Center"/>
+                <CheckBox x:Name="ChkRunResolver" Content="Run resolver after"
+                          IsChecked="True" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                <CheckBox x:Name="ChkCheckpoint" Content="Checkpoint DB on completion"
+                          IsChecked="True" VerticalAlignment="Center" Margin="14,0,0,0"/>
+            </StackPanel>
+
+            <TextBlock x:Name="TxtStatus" Foreground="#666" Margin="0,10,0,4" Text="Ready."/>
+        </StackPanel>
+
+        <!-- Middle: output -->
+        <GroupBox Header="Output">
+            <TextBox x:Name="TxtOutput" IsReadOnly="True" AcceptsReturn="True"
+                     TextWrapping="NoWrap" FontFamily="Consolas" FontSize="11"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                     Background="#111" Foreground="#E0E0E0"/>
+        </GroupBox>
+
+    </DockPanel>
+</Window>

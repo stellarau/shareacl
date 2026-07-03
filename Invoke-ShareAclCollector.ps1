@@ -384,7 +384,15 @@ if ($conn -and $conn.State -ne [System.Data.ConnectionState]::Closed) {
         $conn.Close()
         $conn.Dispose()
     }
+    try {
+        Invoke-SqliteQuery -DataSource $Database `
+            -Query "PRAGMA wal_checkpoint(TRUNCATE);" | Out-Null
+    } catch { }
     Complete-ScanRecord -Path $Database -ScanId $scanId -Status $status `
                         -Folders $totalFolders -Aces $totalAces -Errors $totalErrors
     Write-Host "Scan $scanId finished: status=$status, folders=$totalFolders, aces=$totalAces, errors=$totalErrors" -ForegroundColor Green
 }
+
+
+# Explicit exit code so callers can detect success/failure without parsing output
+if ($status -eq 'completed') { exit 0 } else { exit 1 }

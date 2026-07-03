@@ -53,7 +53,7 @@
                 <Button x:Name="NavFindings" Content="Findings"      HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
                 <TextBlock Text="ACTIONS" FontWeight="Bold" Foreground="#888" Margin="6,16,0,4"/>
                 <Button x:Name="NavSwap"     Content="ACL Swap"      HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
-                <Button x:Name="NavCollect"  Content="New scan…"     HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2" IsEnabled="False"/>
+                <Button x:Name="NavCollect"  Content="New scan…"     HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
             </StackPanel>
         </Border>
 

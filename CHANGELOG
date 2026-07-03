@@ -1,3 +1,11 @@
+== ShareAcl v0.6 - 2026-07-03 ==
+
+New features:
+- Added New scan functionality to allow creating a new scan from the GUI, including a modal dialog for specifying the scan root and options. The new scan is persisted in the database and can be selected for future operations.
+
+Improvements:
+- Added exit codes to Invoke-ShareAclCollector.ps1 and Invoke-ShareAclResolver.ps1 to allow callers to detect success/failure without parsing output.
+
 == ShareAcl v0.5 - 2026-07-01 ==
 
 New features:

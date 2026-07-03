@@ -169,3 +169,4 @@ foreach ($g in $groups) {
 }
 
 Write-Host "Resolution complete." -ForegroundColor Green
+exit 0
