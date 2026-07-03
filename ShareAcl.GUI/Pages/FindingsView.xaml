@@ -72,6 +72,7 @@
 
                 <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
                     <Button x:Name="BtnOpenInFolder" Content="Open selected in Folder view" Padding="10,4" IsEnabled="False"/>
+                    <Button x:Name="BtnSwapPrincipal" Content="Swap this principal…" Padding="10,4" Margin="6,0,0,0" IsEnabled="False"/>
                     <Button x:Name="BtnCopyPath"     Content="Copy path"                    Padding="10,4" Margin="6,0,0,0" IsEnabled="False"/>
                     <Button x:Name="BtnExportCsv"    Content="Export CSV…"                  Padding="10,4" Margin="6,0,0,0" IsEnabled="False"/>
                 </StackPanel>

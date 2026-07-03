@@ -5,15 +5,16 @@ param(
 )
 
 # Controls
-$lstFindings     = $Page.FindName('LstFindings')
-$txtSummary      = $Page.FindName('TxtSummary')
-$txtFindingName  = $Page.FindName('TxtFindingName')
-$txtFindingDesc  = $Page.FindName('TxtFindingDesc')
-$grdDetail       = $Page.FindName('GrdDetail')
-$btnRefresh      = $Page.FindName('BtnRefresh')
-$btnOpenFolder   = $Page.FindName('BtnOpenInFolder')
-$btnCopyPath     = $Page.FindName('BtnCopyPath')
-$btnExport       = $Page.FindName('BtnExportCsv')
+$lstFindings      = $Page.FindName('LstFindings')
+$txtSummary       = $Page.FindName('TxtSummary')
+$txtFindingName   = $Page.FindName('TxtFindingName')
+$txtFindingDesc   = $Page.FindName('TxtFindingDesc')
+$grdDetail        = $Page.FindName('GrdDetail')
+$btnRefresh       = $Page.FindName('BtnRefresh')
+$btnOpenFolder    = $Page.FindName('BtnOpenInFolder')
+$btnSwapPrincipal = $Page.FindName('BtnSwapPrincipal')
+$btnCopyPath      = $Page.FindName('BtnCopyPath')
+$btnExport        = $Page.FindName('BtnExportCsv')
 
 # Severity → colour
 $severityBrush = @{
@@ -33,6 +34,7 @@ $findings = @(
         Id          = 'orphaned'
         Name        = 'Orphaned SIDs on ACEs'
         Severity    = 'High'
+        SwapCapable = $true
         Description = 'ACEs referencing SIDs that no longer resolve to an AD principal. These are deleted accounts whose references in the filesystem persist. Core overhaul target.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -53,6 +55,7 @@ ORDER BY f.path
         Id          = 'everyone'
         Name        = '"Everyone" exposure'
         Severity    = 'High'
+        SwapCapable = $false
         Description = 'Folders with an ACE granting the Everyone group (S-1-1-0). Almost never intentional outside legacy public shares.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -71,6 +74,7 @@ ORDER BY f.path
     Id          = 'nonadmin_fullcontrol'
     Name        = 'Non-admin Full Control'
     Severity    = 'High'
+    SwapCapable = $true
     Description = 'Allow ACEs granting Full Control to principals that are NOT transitively members of BUILTIN\Administrators, Domain Admins, or Enterprise Admins. Excludes well-known admin SIDs, the built-in Administrator account, and any user/group whose membership in an admin group is recorded in the resolver output.'
     Query       = @"
 SELECT f.path                              AS Path,
@@ -109,6 +113,7 @@ ORDER BY f.path
     Id          = 'admin_member_fullcontrol'
     Name        = 'Admin principal with explicit Full Control'
     Severity    = 'Info'
+    SwapCapable = $true
     Description = 'Allow Full Control ACEs held by individual users or groups that are transitively members of an admin group (BUILTIN\Administrators, Domain Admins, or Enterprise Admins). Typically benign — admin accounts are often granted explicit FC so permission edits work without elevation — but worth reviewing in environments where admin assignments should always flow through groups.'
     Query       = @"
 SELECT f.path                              AS Path,
@@ -145,6 +150,7 @@ ORDER BY f.path, Trustee
         Id          = 'unreachable'
         Name        = 'Unreachable folders'
         Severity    = 'High'
+        SwapCapable = $false
         Description = 'Folders with broken inheritance AND zero explicit ACEs. Nobody but the owner and admins can access these — usually a misclick on the Security tab. High because they often hide data nobody knows is there.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -163,6 +169,7 @@ ORDER BY f.path
         Id          = 'broad_exposure'
         Name        = 'Broad principal exposure'
         Severity    = 'Medium'
+        SwapCapable = $false
         Description = 'Explicit ACEs granting access to broad populations: Authenticated Users, BUILTIN\Users, or Domain Users. Sometimes deliberate at a share root, rarely deliberate on a subfolder.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -188,6 +195,7 @@ ORDER BY f.path
         Id          = 'direct_user_aces'
         Name        = 'Direct user ACEs (anti-pattern)'
         Severity    = 'Medium'
+        SwapCapable = $true
         Description = 'Explicit ACEs assigned to individual users rather than groups. Hard to maintain, hard to off-board, and a frequent cause of permissions drift.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -209,6 +217,7 @@ ORDER BY f.path, p.name
         Id          = 'deny_aces'
         Name        = 'Deny ACEs'
         Severity    = 'Info'
+        SwapCapable = $false
         Description = 'All Deny ACEs in scope. Worth a review during overhaul: a Deny is usually a workaround for a structural problem upstream in the group design.'
         Query       = @"
 SELECT f.path                              AS Path,
@@ -228,6 +237,7 @@ ORDER BY f.path
         Id          = 'scan_errors'
         Name        = 'Scan errors'
         Severity    = 'Info'
+        SwapCapable = $false
         Description = 'Paths the collector could not enumerate or read. Usually access-denied (the scanning account lacks permission) or path-too-long. Worth triaging because anything in here is a gap in your audit.'
         Query       = @"
 SELECT path        AS Path,
@@ -303,12 +313,59 @@ $loadDetail = {
     $btnCopyPath.IsEnabled   = $false
 }.GetNewClosure()
 
+$getRowSidAndName = {
+    param($Row, $Finding)
+    if (-not $Row) { return $null }
+    $props = $Row.PSObject.Properties.Name
+
+    # Prefer explicit Sid column (orphaned finding), then look up name via principals table
+    if ('Sid' -in $props -and $Row.Sid) {
+        $sid = [string]$Row.Sid
+        $name = try {
+            $p = $App.Query('SELECT name FROM principals WHERE sid = @s', @{ s = $sid })
+            if ($p -and $p.name) { $p.name } else { $sid }
+        } catch { $sid }
+        return @{ Sid = $sid; Name = $name }
+    }
+
+    # Trustee or User column: look up SID via principals table
+    $trusteeText = $null
+    foreach ($col in 'Trustee','User') {
+        if ($col -in $props -and $Row.$col) { $trusteeText = [string]$Row.$col; break }
+    }
+    if (-not $trusteeText) { return $null }
+
+    # If the trustee text already looks like a SID, use it directly
+    if ($trusteeText -match '^S-1-\d+(-\d+)+$') {
+        return @{ Sid = $trusteeText; Name = $trusteeText }
+    }
+
+    try {
+        $p = $App.Query(
+            'SELECT sid, name FROM principals WHERE name = @n OR sam_account_name = @n LIMIT 1',
+            @{ n = $trusteeText })
+        if ($p -and $p.sid) {
+            return @{ Sid = [string]$p.sid; Name = [string]$p.name }
+        }
+    } catch { }
+
+    return $null
+}.GetNewClosure()
+
 # Row selection inside the detail grid
 $grdDetail.Add_SelectionChanged({
     $sel = $grdDetail.SelectedItem
     $hasPath = ($sel -ne $null) -and ($sel.PSObject.Properties.Match('Path').Count -gt 0) -and $sel.Path
     $btnOpenFolder.IsEnabled = [bool]$hasPath
     $btnCopyPath.IsEnabled   = [bool]$hasPath
+
+    $currentFinding = $lstFindings.SelectedItem
+    $canSwap = $sel -and $currentFinding -and $currentFinding.SwapCapable
+    if ($canSwap) {
+        $resolved = & $getRowSidAndName $sel $currentFinding
+        $canSwap = ($null -ne $resolved)
+    }
+    $btnSwapPrincipal.IsEnabled = [bool]$canSwap
 }.GetNewClosure())
 
 # Catalogue selection
@@ -332,6 +389,31 @@ $btnOpenFolder.Add_Click({
         $App.NavContext = @{ PathFilter = [string]$sel.Path }
         $App.Navigate('FolderView')
     }
+}.GetNewClosure())
+
+$btnSwapPrincipal.Add_Click({
+    $sel = $grdDetail.SelectedItem
+    $currentFinding = $lstFindings.SelectedItem
+    if (-not $sel -or -not $currentFinding) { return }
+
+    $resolved = & $getRowSidAndName $sel $currentFinding
+    if (-not $resolved) {
+        $App.ShowError('Cannot resolve principal',
+            'Could not determine a SID for the selected row. Try running the resolver against this scan.')
+        return
+    }
+
+    $ctx = @{
+        SourceSid  = $resolved.Sid
+        SourceName = $resolved.Name
+    }
+    # Path is optional but useful — pre-fill scope if the finding row carries one
+    if ($sel.PSObject.Properties.Match('Path').Count -gt 0 -and $sel.Path) {
+        $ctx.Scope = [string]$sel.Path
+    }
+
+    $App.NavContext = $ctx
+    $App.Navigate('SwapView')
 }.GetNewClosure())
 
 $btnExport.Add_Click({

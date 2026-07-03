@@ -1,3 +1,11 @@
+== ShareAcl v0.7 - 2026-07-03 ==
+
+New features:
+- Added New database functionality to allow creating a new database from the GUI, including a modal dialog
+
+Bug fixes:
+- Fixed no navigation items enabled when no database is loaded
+
 == ShareAcl v0.6 - 2026-07-03 ==
 
 New features:

@@ -105,6 +105,33 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name Navigate -Value {
 # -----------------------------------------------------------------------------
 # DB layer
 # -----------------------------------------------------------------------------
+
+function Ensure-DatabaseLoaded {
+    param([string]$Reason = 'This action requires a database.')
+
+    if ($Script:App.DbPath -and $Script:App.Connection) { return $true }
+
+    $ans = [System.Windows.MessageBox]::Show($Script:App.Window,
+        "$Reason`n`nYes: open an existing database.`nNo: create a new database.`nCancel: return without doing anything.",
+        'No database loaded', 'YesNoCancel', 'Question')
+
+    switch ($ans) {
+        'Yes' {
+            $window = $Script:App.Window
+            $window.FindName('BtnBrowseDb').RaiseEvent(
+                [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+            if ($window.FindName('TxtDbPath').Text) {
+                $window.FindName('BtnOpenDb').RaiseEvent(
+                    [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+            }
+        }
+        'No'    { New-ShareAclDatabase -SkipScanPrompt }
+        default { }
+    }
+
+    return ($Script:App.DbPath -and $Script:App.Connection)
+}
+
 function Open-ShareAclDatabase {
     param([string]$Path)
 
@@ -368,15 +395,124 @@ function Show-PrincipalPicker {
 }
 
 # -----------------------------------------------------------------------------
+# New database dialog
+# -----------------------------------------------------------------------------
+
+function New-ShareAclDatabase {
+    param([switch]$SkipScanPrompt)
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title    = 'Create ShareACL database'
+    $dlg.Filter   = 'ShareACL database (*.db)|*.db'
+    $dlg.FileName = 'shareacl.db'
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $target = $dlg.FileName
+
+    if (Test-Path $target) {
+        $ans = [System.Windows.MessageBox]::Show(
+            "$target already exists.`n`nOverwrite? This will delete any existing scans, resolver output, and swap history in that file.",
+            'Overwrite existing database?', 'YesNo', 'Warning')
+        if ($ans -ne 'Yes') { return }
+
+        # Close any current connection to that file before overwriting
+        if ($Script:App.DbPath -eq $target) { Close-ShareAclDatabase }
+        try {
+            Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+        } catch {
+            [System.Windows.MessageBox]::Show($Script:App.Window,
+                "Could not remove existing file:`n$($_.Exception.Message)",
+                'New database', 'OK', 'Error') | Out-Null
+            return
+        }
+    }
+
+    # Delegate schema creation to the collector's Initialize-Database.
+    # Rather than duplicating the schema-loading logic in the shell, we invoke
+    # a minimal pwsh child that dot-sources schema.sql via PSSQLite. This keeps
+    # the schema authoritative in one place (schema.sql).
+    $schemaPath = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\schema.sql'))
+    if (-not (Test-Path $schemaPath)) {
+        [System.Windows.MessageBox]::Show($Script:App.Window,
+            "schema.sql not found:`n$schemaPath",
+            'New database', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    try {
+        # Create the (empty) file so PSSQLite has something to open
+        New-Item -ItemType File -Path $target -Force | Out-Null
+
+        $schemaSql = Get-Content -Raw -Path $schemaPath
+        Invoke-SqliteQuery -DataSource $target -Query $schemaSql | Out-Null
+
+        # Also apply the swap-journal migration (mirrors what Open-ShareAclDatabase does)
+        Invoke-SqliteQuery -DataSource $target -Query @"
+            CREATE TABLE IF NOT EXISTS swap_runs (
+                run_id TEXT PRIMARY KEY,
+                started_utc TEXT NOT NULL,
+                completed_utc TEXT,
+                operator TEXT NOT NULL,
+                host TEXT NOT NULL,
+                source_sid TEXT NOT NULL,
+                source_name TEXT,
+                target_sid TEXT NOT NULL,
+                target_name TEXT,
+                scope_root TEXT NOT NULL,
+                based_on_scan INTEGER REFERENCES scans(scan_id),
+                discovery_mode TEXT NOT NULL CHECK (discovery_mode IN ('scan','live')),
+                folder_count INTEGER NOT NULL DEFAULT 0,
+                ok_count INTEGER NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS swap_results (
+                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES swap_runs(run_id),
+                path TEXT NOT NULL,
+                result TEXT NOT NULL CHECK (result IN ('ok','fail','skip','noop')),
+                detail TEXT,
+                when_utc TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_swap_results_run ON swap_results(run_id);
+            CREATE INDEX IF NOT EXISTS ix_swap_runs_source ON swap_runs(source_sid);
+            CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);
+"@ | Out-Null
+    } catch {
+        [System.Windows.MessageBox]::Show($Script:App.Window,
+            "Database creation failed:`n$($_.Exception.Message)",
+            'New database', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    # Automatically open the new database and offer to run a scan
+    $window = $Script:App.Window
+    $window.FindName('TxtDbPath').Text = $target
+    try {
+        Open-ShareAclDatabase -Path $target
+        Refresh-ScanCombo
+        Set-NavEnabled $true
+    } catch {
+        [System.Windows.MessageBox]::Show($window,
+            "Database created but open failed:`n$($_.Exception.Message)",
+            'New database', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    if (-not $SkipScanPrompt) {
+        $ans = [System.Windows.MessageBox]::Show($window,
+            "Database created at:`n$target`n`nStart a new scan now?",
+            'New database ready', 'YesNo', 'Question')
+        if ($ans -eq 'Yes') {
+            Show-NewScanDialog
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
 # New scan dialog (modal window)
 # -----------------------------------------------------------------------------
 
 function Show-NewScanDialog {
-    if (-not $Script:App.DbPath -or -not $Script:App.Connection) {
-        [System.Windows.MessageBox]::Show('Open a database first.', 'New scan', 'OK', 'Warning') | Out-Null
-        return
-    }
-
+    if (-not (Ensure-DatabaseLoaded -Reason 'A database is required before scanning.')) { return }
     
     # Capture App reference locally so closures can rely on it.
     # $Script: scope doesn't survive .GetNewClosure() across event handlers.
@@ -744,9 +880,17 @@ function Update-DbInfoLabel {
 
 function Set-NavEnabled {
     param([bool]$Enabled)
-    foreach ($name in 'NavFolder','NavAccount','NavFindings','NavSwap','NavCollect') {
+
+    # Views require a loaded DB (they read from it)
+    foreach ($name in 'NavFolder','NavAccount','NavFindings') {
         $btn = $Script:App.NavButtons[$name]
         if ($btn) { $btn.IsEnabled = $Enabled }
+    }
+
+    # Actions are always available — they prompt for a DB if none is loaded
+    foreach ($name in 'NavNewDb','NavCollect','NavSwap') {
+        $btn = $Script:App.NavButtons[$name]
+        if ($btn) { $btn.IsEnabled = $true }
     }
 }
 
@@ -764,7 +908,7 @@ $Script:App.StatusBar  = $window.FindName('TxtStatus')
 $Script:App.DbInfo     = $window.FindName('TxtDbInfo')
 $Script:App.PageHost   = $window.FindName('PageHost')
 
-foreach ($name in 'NavFolder','NavAccount','NavFindings','NavSwap','NavCollect') {
+foreach ($name in 'NavFolder','NavAccount','NavFindings','NavSwap','NavNewDb','NavCollect') {
     $Script:App.NavButtons[$name] = $window.FindName($name)
 }
 
@@ -802,7 +946,7 @@ $window.FindName('CmbScan').Add_SelectionChanged({
         if ($btn) { $btn.IsEnabled = $hasScan }
     }
     # NavSwap stays enabled regardless — it works in live mode without a scan.
-    # NavCollect stays enabled regardless once it's wired (future iteration).
+    # NavNewDb and NavCollect stay enabled regardless
 
     if ($hasScan) {
         Set-Status "Active scan: #$($Script:App.CurrentScanId)"
@@ -815,7 +959,11 @@ $window.FindName('CmbScan').Add_SelectionChanged({
 $Script:App.NavButtons['NavFolder'].Add_Click({ Navigate-Page 'FolderView' })
 $Script:App.NavButtons['NavAccount'].Add_Click({ Navigate-Page 'AccountView' })
 $Script:App.NavButtons['NavFindings'].Add_Click({ Navigate-Page 'FindingsView' })
-$Script:App.NavButtons['NavSwap'].Add_Click({ Navigate-Page 'SwapView' })
+$Script:App.NavButtons['NavSwap'].Add_Click({
+    if (-not (Ensure-DatabaseLoaded -Reason 'A database is required to record swap operations.')) { return }
+    Navigate-Page 'SwapView'
+})
+$Script:App.NavButtons['NavNewDb'].Add_Click({ New-ShareAclDatabase })
 $Script:App.NavButtons['NavCollect'].Add_Click({ Show-NewScanDialog })
 
 # Close cleanly

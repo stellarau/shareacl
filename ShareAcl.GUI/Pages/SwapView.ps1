@@ -694,7 +694,21 @@ $Page.Add_Unloaded({
 $App.SetStatus("Swap workflow loaded.")
 
 # Pre-fill scope if navigated from another view that set NavContext.Scope
-if ($App.NavContext -and $App.NavContext.Scope) {
-    $txtScope.Text = [string]$App.NavContext.Scope
-    $App.NavContext = $null
+if ($App.NavContext) {
+    $ctx = $App.NavContext
+    $App.NavContext = $null   # consume once
+
+    if ($ctx.Scope) {
+        $txtScope.Text = [string]$ctx.Scope
+    }
+    if ($ctx.SourceSid) {
+        $state.Source = @{
+            Sid  = [string]$ctx.SourceSid
+            Name = [string]$ctx.SourceName
+            Sam  = $null
+            Type = $null
+        }
+        $txtSource.Text = "$($state.Source.Name)   [from Findings]   $($state.Source.Sid)"
+        $App.SetStatus("Source pre-filled from Findings: $($state.Source.Name)")
+    }
 }
