@@ -176,6 +176,45 @@ function Open-ShareAclDatabase {
             CREATE INDEX IF NOT EXISTS ix_swap_runs_target ON swap_runs(target_sid);
 "@ | Out-Null
 
+    # Migration: progress tracking columns on the scans table
+    $needsProgressMigration = (Invoke-SqliteQuery -DataSource $Path -Query @"
+        SELECT COUNT(*) AS n FROM pragma_table_info('scans') WHERE name = 'total_folders'
+"@).n -eq 0
+
+    if ($needsProgressMigration) {
+        Invoke-SqliteQuery -DataSource $Path -Query @"
+            PRAGMA foreign_keys = OFF;
+            BEGIN;
+            CREATE TABLE scans_new (
+                scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_utc TEXT NOT NULL,
+                completed_utc TEXT,
+                root_paths_json TEXT NOT NULL,
+                host TEXT,
+                operator TEXT,
+                status TEXT NOT NULL CHECK (status IN ('counting','running','completed','failed','aborted')),
+                folder_count INTEGER NOT NULL DEFAULT 0,
+                ace_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                notes TEXT,
+                total_folders INTEGER,
+                processed_folders INTEGER NOT NULL DEFAULT 0,
+                folders_per_second REAL,
+                estimated_completion_utc TEXT,
+                last_updated_utc TEXT
+            );
+            INSERT INTO scans_new (scan_id, started_utc, completed_utc, root_paths_json,
+                                host, operator, status, folder_count, ace_count, error_count, notes)
+                SELECT scan_id, started_utc, completed_utc, root_paths_json,
+                    host, operator, status, folder_count, ace_count, error_count, notes
+                FROM scans;
+            DROP TABLE scans;
+            ALTER TABLE scans_new RENAME TO scans;
+            COMMIT;
+            PRAGMA foreign_keys = ON;
+"@ | Out-Null
+    }
+
     Close-ShareAclDatabase
 
     $conn = New-SQLiteConnection -DataSource $Path
@@ -526,18 +565,22 @@ function Show-NewScanDialog {
     $win    = [System.Windows.Markup.XamlReader]::Load($reader)
     $win.Owner = $Script:App.Window
 
-    $txtRoots      = $win.FindName('TxtRoots')
-    $txtBatch      = $win.FindName('TxtBatchSize')
-    $txtDepth      = $win.FindName('TxtMaxDepth')
-    $chkResolver   = $win.FindName('ChkRunResolver')
-    $chkCheckpoint = $win.FindName('ChkCheckpoint')
-    $btnBrowse     = $win.FindName('BtnBrowsePath')
-    $btnPrefill    = $win.FindName('BtnPrefillPrev')
-    $btnStart      = $win.FindName('BtnStart')
-    $btnCancel     = $win.FindName('BtnCancel')
-    $btnClose      = $win.FindName('BtnClose')
-    $txtOutput     = $win.FindName('TxtOutput')
-    $txtStatus     = $win.FindName('TxtStatus')
+    $txtRoots         = $win.FindName('TxtRoots')
+    $txtBatch         = $win.FindName('TxtBatchSize')
+    $txtDepth         = $win.FindName('TxtMaxDepth')
+    $chkResolver      = $win.FindName('ChkRunResolver')
+    $chkCheckpoint    = $win.FindName('ChkCheckpoint')
+    $btnBrowse        = $win.FindName('BtnBrowsePath')
+    $btnPrefill       = $win.FindName('BtnPrefillPrev')
+    $btnStart         = $win.FindName('BtnStart')
+    $btnCancel        = $win.FindName('BtnCancel')
+    $btnClose         = $win.FindName('BtnClose')
+    $borderProgress   = $win.FindName('BorderProgress')
+    $pbProgress       = $win.FindName('PbProgress')
+    $txtProgressLeft  = $win.FindName('TxtProgressLeft')
+    $txtProgressRight = $win.FindName('TxtProgressRight')
+    $txtOutput        = $win.FindName('TxtOutput')
+    $txtStatus        = $win.FindName('TxtStatus')
 
     $collectorPath = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\Invoke-ShareAclCollector.ps1'))
     $resolverPath  = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\Invoke-ShareAclResolver.ps1'))
@@ -561,6 +604,7 @@ function Show-NewScanDialog {
         OnExit        = $null       # scriptblock invoked on UI thread when process exits
         StdoutRegId   = $null       # event subscription IDs for cleanup
         StderrRegId   = $null
+        TickCount     = 0           # for throttling UI updates
     }
 
     # --- UI-thread helpers (no dispatcher marshalling needed) ---
@@ -571,6 +615,70 @@ function Show-NewScanDialog {
             $txtOutput.AppendText($line + "`r`n")
         }
         $txtOutput.ScrollToEnd()
+    }.GetNewClosure()
+
+    $pollProgress = {
+        try {
+            $row = Invoke-SqliteQuery -DataSource $app.DbPath -Query @"
+                SELECT scan_id, status, total_folders, processed_folders,
+                    folders_per_second, estimated_completion_utc, started_utc
+                FROM scans
+                WHERE status IN ('counting','running')
+                ORDER BY scan_id DESC LIMIT 1
+"@
+        } catch {
+            return
+        }
+
+        if (-not $row) {
+            $borderProgress.Visibility = [System.Windows.Visibility]::Collapsed
+            return
+        }
+        $borderProgress.Visibility = [System.Windows.Visibility]::Visible
+
+        if ($row.status -eq 'counting') {
+            $pbProgress.IsIndeterminate = $true
+            $txtProgressLeft.Text  = 'Counting folders…'
+            $txtProgressRight.Text = ''
+            return
+        }
+
+        # status = 'running'
+        $pbProgress.IsIndeterminate = $false        
+        $totalRaw = $row.total_folders
+        $total = if ($totalRaw -and $totalRaw -isnot [System.DBNull]) { [int64]$totalRaw } else { 0 }
+        $proc  = [int64]$row.processed_folders
+        $pct   = if ($total -gt 0) { [Math]::Min(100, ($proc / $total) * 100) } else { 0 }
+        $pbProgress.Value = $pct
+
+        $txtProgressLeft.Text = if ($total -gt 0) {
+            "{0:N0} / {1:N0} folders  ({2:N1}%)" -f $proc, $total, $pct
+        } else {
+            "{0:N0} folders processed (total unknown)" -f $proc
+        }
+
+        $etaRaw = $row.estimated_completion_utc
+        if ($etaRaw -and $etaRaw -isnot [System.DBNull]) {
+            try {
+                $etaUtc = [DateTime]::Parse($etaRaw, $null,
+                            [System.Globalization.DateTimeStyles]::RoundtripKind)
+                $etaLocal  = $etaUtc.ToLocalTime()
+                $remaining = $etaUtc - [DateTime]::UtcNow
+                if ($remaining.TotalSeconds -lt 0) { $remaining = [TimeSpan]::Zero }
+
+                $hours   = [Math]::Floor($remaining.TotalHours)
+                $minutes = $remaining.Minutes
+                $seconds = $remaining.Seconds
+                $etaStr  = "{0}h {1:D2}m {2:D2}s" -f $hours, $minutes, $seconds
+
+                $txtProgressRight.Text = ("ETA {0}   ·   Finish {1}" -f $etaStr,
+                                        $etaLocal.ToString('yyyy-MM-dd HH:mm:ss'))
+            } catch {
+                $txtProgressRight.Text = 'Calculating ETA…'
+            }
+        } else {
+            $txtProgressRight.Text = 'Calculating ETA…'
+        }
     }.GetNewClosure()
 
     $appendLine = {
@@ -645,6 +753,10 @@ function Show-NewScanDialog {
     $timer.Interval = [TimeSpan]::FromMilliseconds(100)
     $timer.Add_Tick({
         & $drainQueue
+    
+        $dlgState.TickCount++
+        if (($dlgState.TickCount % 10) -eq 0) { & $pollProgress }
+
         if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
             $timer.Stop()
 
@@ -661,6 +773,11 @@ function Show-NewScanDialog {
             $exitCode = $dlgState.Proc.ExitCode
             Start-Sleep -Milliseconds 100
             & $drainQueue
+
+            
+            # Final poll to catch the last progress update, then hide the bar
+            & $pollProgress
+            $borderProgress.Visibility = [System.Windows.Visibility]::Collapsed
 
             & $onScanExit $exitCode
         }
@@ -695,6 +812,13 @@ function Show-NewScanDialog {
 
         $runResolver = [bool]$chkResolver.IsChecked
         $dlgState.Phase = 'collecting'
+
+        $borderProgress.Visibility = [System.Windows.Visibility]::Collapsed
+        $pbProgress.Value = 0
+        $pbProgress.IsIndeterminate = $false
+        $txtProgressLeft.Text  = ''
+        $txtProgressRight.Text = ''
+        $dlgState.TickCount = 0
 
         $txtOutput.Clear()
         & $setRunningUi $true
@@ -780,6 +904,7 @@ function Show-NewScanDialog {
         $dlgState.StdoutRegId = $stdoutReg.Id
         $dlgState.StderrRegId = $stderrReg.Id
         $timer.Start()
+        & $pollProgress
     }.GetNewClosure())
 
     $btnCancel.Add_Click({

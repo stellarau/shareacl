@@ -88,6 +88,53 @@ function Complete-ScanRecord {
 "@ -SqlParameters @{ done=$now; status=$Status; fc=$Folders; ac=$Aces; ec=$Errors; id=$ScanId } | Out-Null
 }
 
+function Set-ScanStatus {
+    param([string]$Path, [int]$ScanId, [string]$Status)
+    Invoke-SqliteQuery -DataSource $Path -Query @"
+        UPDATE scans SET status = @s, last_updated_utc = @now WHERE scan_id = @id
+"@ -SqlParameters @{
+        s   = $Status
+        now = [System.DateTime]::UtcNow.ToString('o')
+        id  = $ScanId
+    } | Out-Null
+}
+
+function Set-ScanTotal {
+    param([string]$Path, [int]$ScanId, [int64]$Total)
+    Invoke-SqliteQuery -DataSource $Path -Query @"
+        UPDATE scans SET total_folders = @t, last_updated_utc = @now WHERE scan_id = @id
+"@ -SqlParameters @{
+        t   = $Total
+        now = [System.DateTime]::UtcNow.ToString('o')
+        id  = $ScanId
+    } | Out-Null
+}
+
+function Update-ScanProgress {
+    param(
+        [System.Data.SQLite.SQLiteConnection]$Conn,
+        [int]     $ScanId,
+        [int64]   $Processed,
+        [double]  $Rate,
+        [datetime]$EtaUtc
+    )
+    $cmd = $Conn.CreateCommand()
+    $cmd.CommandText = @"
+        UPDATE scans SET
+            processed_folders        = @p,
+            folders_per_second       = @r,
+            estimated_completion_utc = @eta,
+            last_updated_utc         = @now
+         WHERE scan_id = @id
+"@
+    [void]$cmd.Parameters.AddWithValue('@p',   $Processed)
+    [void]$cmd.Parameters.AddWithValue('@r',   $Rate)
+    [void]$cmd.Parameters.AddWithValue('@eta', $EtaUtc.ToString('o'))
+    [void]$cmd.Parameters.AddWithValue('@now', [System.DateTime]::UtcNow.ToString('o'))
+    [void]$cmd.Parameters.AddWithValue('@id',  $ScanId)
+    [void]$cmd.ExecuteNonQuery()
+}
+
 function Write-ScanError {
     param([System.Data.SQLite.SQLiteConnection]$Conn, [int]$ScanId, [string]$ItemPath, [string]$Phase, [string]$Message)
     $cmd = $Conn.CreateCommand()
@@ -147,6 +194,45 @@ function Get-FolderFacts {
     }
 }
 
+function Get-FolderCount {
+    <#
+        Fast BFS folder count using System.IO.Directory.EnumerateDirectories per level,
+        so an inaccessible folder doesn't halt the whole enumeration. Honours MaxDepth
+        the same way the main collector does.
+    #>
+    param(
+        [string[]] $Roots,
+        [int]      $MaxDepth
+    )
+
+    $total = 0
+    $announceEvery = 5000
+    $queue = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($r in $Roots) {
+        $queue.Enqueue(@{ Path = $r; Depth = 0 })
+    }
+
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        $total++
+
+        if (($total % $announceEvery) -eq 0) {
+            Write-Host ("  counting… {0:N0} folders discovered so far" -f $total)
+        }
+
+        if ($MaxDepth -gt 0 -and $cur.Depth -ge $MaxDepth) { continue }
+
+        try {
+            foreach ($sub in [System.IO.Directory]::EnumerateDirectories($cur.Path)) {
+                $queue.Enqueue(@{ Path = $sub; Depth = $cur.Depth + 1 })
+            }
+        } catch {
+            # Inaccessible / long-path / permission — collector will log per-folder when it hits this
+        }
+    }
+    $total
+}
+
 function Get-AceTrusteeSid {
     <#
         Returns the trustee SID string for an ACE from Get-NTFSAccess,
@@ -202,6 +288,46 @@ if ($Resume) {
 "@ -SqlParameters @{ s=$scanId; p=$r } | Out-Null
     }
 }
+
+$totalCount   = $null
+$runStartTime = $null
+
+if (-not $Resume) {
+    # Transition to counting phase
+    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'counting'
+    Write-Host "Counting folders under: $($RootPath -join ', ')" -ForegroundColor Cyan
+
+    $countStart = [System.DateTime]::UtcNow
+    try {
+        $totalCount = Get-FolderCount -Roots $RootPath -MaxDepth $MaxDepth
+        $countElapsed = ([System.DateTime]::UtcNow - $countStart).TotalSeconds
+        Write-Host ("Count complete: {0:N0} folders in {1:N1}s" -f $totalCount, $countElapsed) -ForegroundColor Cyan
+        Set-ScanTotal -Path $Database -ScanId $scanId -Total $totalCount
+    } catch {
+        Write-Host "Counting phase failed: $($_.Exception.Message). Proceeding without total." -ForegroundColor Yellow
+        $totalCount = $null
+    }
+
+    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'running'
+
+    # Seed the pending queue with the roots (moved here from the existing spot, unchanged)
+    foreach ($r in $RootPath) {
+        Invoke-SqliteQuery -DataSource $Database -Query @"
+            INSERT OR IGNORE INTO folders_pending(scan_id,path,parent_id,depth)
+            VALUES (@s,@p,NULL,0)
+"@ -SqlParameters @{ s=$scanId; p=$r } | Out-Null
+    }
+} else {
+    # For resumed scans, pull the previously-recorded total (may be NULL)
+    $prevRow = Invoke-SqliteQuery -DataSource $Database -Query @"
+        SELECT total_folders FROM scans WHERE scan_id = @id
+"@ -SqlParameters @{ id = $scanId }
+    if ($prevRow -and $prevRow.total_folders) { $totalCount = [int64]$prevRow.total_folders }
+    Set-ScanStatus -Path $Database -ScanId $scanId -Status 'running'
+}
+
+# Record the moment the actual scan begins — used for rate calc, excludes the counting phase
+$runStartTime = [System.DateTime]::UtcNow
 
 # Open one long-lived connection for the bulk write loop
 $conn = New-SQLiteConnection -DataSource $Database
@@ -349,6 +475,18 @@ try {
         }
 
         Write-Host ("  processed {0,8} folders | {1,9} ACEs | {2,4} errors" -f $totalFolders, $totalAces, $totalErrors)
+        if ($totalCount -and $totalCount -gt 0) {
+            $elapsed = ([System.DateTime]::UtcNow - $runStartTime).TotalSeconds
+            $rate    = if ($elapsed -gt 0) { $totalFolders / $elapsed } else { 0 }
+            $remaining = [Math]::Max(0, $totalCount - $totalFolders)
+            $etaSecs = if ($rate -gt 0) { $remaining / $rate } else { 0 }
+            $etaUtc  = [System.DateTime]::UtcNow.AddSeconds($etaSecs)
+
+            try {
+                Update-ScanProgress -Conn $conn -ScanId $scanId `
+                                    -Processed $totalFolders -Rate $rate -EtaUtc $etaUtc
+            } catch { }
+        }
     }
     $status = 'completed'
 }

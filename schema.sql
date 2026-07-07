@@ -1,20 +1,26 @@
--- ShareACL schema v0.2
+-- ShareACL schema v0.8
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
 -- One row per scan run
 CREATE TABLE IF NOT EXISTS scans (
-    scan_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_utc      TEXT    NOT NULL,
-    completed_utc    TEXT,
-    root_paths_json  TEXT    NOT NULL,
-    host             TEXT,
-    operator         TEXT,
-    status           TEXT    NOT NULL CHECK (status IN ('running','completed','failed','aborted')),
-    folder_count     INTEGER NOT NULL DEFAULT 0,
-    ace_count        INTEGER NOT NULL DEFAULT 0,
-    error_count      INTEGER NOT NULL DEFAULT 0,
-    notes            TEXT
+    scan_id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_utc              TEXT    NOT NULL,
+    completed_utc            TEXT,
+    root_paths_json          TEXT    NOT NULL,
+    host                     TEXT,
+    operator                 TEXT,
+    status                   TEXT    NOT NULL CHECK (status IN
+                                    ('counting','running','completed','failed','aborted')),
+    folder_count             INTEGER NOT NULL DEFAULT 0,
+    ace_count                INTEGER NOT NULL DEFAULT 0,
+    error_count              INTEGER NOT NULL DEFAULT 0,
+    notes                    TEXT,
+    total_folders            INTEGER,          -- populated after the counting phase
+    processed_folders        INTEGER NOT NULL DEFAULT 0,
+    folders_per_second       REAL,
+    estimated_completion_utc TEXT,
+    last_updated_utc         TEXT
 );
 
 -- One row per folder visited

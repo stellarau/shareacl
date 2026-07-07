@@ -1,3 +1,11 @@
+== ShareAcl v0.8 - 2026-07-07 ==
+
+New features:
+- Progress bar for new scans in the GUI
+
+General:
+- Added README into project
+
 == ShareAcl v0.7 - 2026-07-03 ==
 
 New features:
