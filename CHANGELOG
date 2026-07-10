@@ -1,3 +1,13 @@
+== ShareAcl v0.9 - 2026-07-10 ==
+
+New features:
+- Added Run resolver action and dialog to allow re-resolving AD principals and group memberships from the GUI without running a full new scan.
+
+Improvements:
+- Added a busy overlay and async query helper so larger Folder, Account, and Findings view queries no longer block the GUI while loading.
+- Suppressed noisy PowerShell CLIXML output from scan and resolver output panes.
+- Minor README tweaks, including a screenshot of Findings
+
 == ShareAcl v0.8 - 2026-07-07 ==
 
 New features:

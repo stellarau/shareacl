@@ -26,6 +26,8 @@ At a high level:
 2. The resolver looks up the SIDs from the scan in Active Directory and records names, account types, and group membership.
 3. The GUI reads the database and presents the results.
 
+![Example Findings](/doc/images/shareacl_findings_example.png "Example Findings")
+
 ## Prerequisites
 
 - PowerShell 7+
@@ -62,7 +64,7 @@ Install-Module NTFSSecurity -Scope CurrentUser
 
 ### Getting started
 
-1. Clone the repository to a device with access to your AD and file shares
+1. Clone the repository (or download and extract a [release](https://github.com/stellarau/shareacl/releases)) to a device with access to your AD and file shares
 2. Run `ShareAcl.GUI\Start-ShareAcl.ps1` (see note below)
 3. On first run, you will need to create a new database
 
@@ -72,8 +74,10 @@ Simple first run:
 
 ```powershell
 cd "C:\Path\To\NTFS Permissions"
-.\ShareAcl.GUI\Start-ShareAcl.ps1
+Set-ExecutionPolicy Bypass -Scope Process;.\ShareAcl.GUI\Start-ShareAcl.ps1
 ```
+
+> **NOTE:** If your environment allows running unsigned scripts, you can leave out the 'Set-ExecutionPolicy' part.
 
 When the window opens:
 

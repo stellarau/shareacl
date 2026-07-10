@@ -53,13 +53,26 @@
                 <Button x:Name="NavFindings" Content="Findings"      HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
                 <TextBlock Text="ACTIONS" FontWeight="Bold" Foreground="#888" Margin="6,16,0,4"/>
                 <Button x:Name="NavSwap"     Content="ACL Swap"      HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
+                <Button x:Name="NavResolve"  Content="Run resolver…" HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
                 <Button x:Name="NavNewDb"    Content="New database…" HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
                 <Button x:Name="NavCollect"  Content="New scan…"     HorizontalContentAlignment="Left" Padding="10,6" Margin="0,2"/>
             </StackPanel>
         </Border>
 
         <!-- Center: page host -->
-        <Frame x:Name="PageHost" NavigationUIVisibility="Hidden" JournalOwnership="OwnsJournal" Background="White"/>
+        <Grid>
+            <Frame x:Name="PageHost" NavigationUIVisibility="Hidden"
+                JournalOwnership="OwnsJournal" Background="White"/>
+            <Border x:Name="BusyOverlay" Background="#80FFFFFF" Visibility="Collapsed"
+                    IsHitTestVisible="True">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <ProgressBar IsIndeterminate="True" Width="200" Height="14"/>
+                    <TextBlock x:Name="BusyText" Text="Loading…"
+                            HorizontalAlignment="Center" Margin="0,10,0,0"
+                            FontSize="13" Foreground="#333"/>
+                </StackPanel>
+            </Border>
+        </Grid>
 
     </DockPanel>
 </Window>
