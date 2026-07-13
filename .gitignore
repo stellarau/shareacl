@@ -1,2 +1,4 @@
 NTFS Permissions.code-workspace
 TODO
+doc/V1-STABILITY-TESTS.md
+ShareAcl.GUI/Test-ShareAclStability.ps1

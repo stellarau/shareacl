@@ -38,9 +38,13 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="TxtStatus" Grid.Column="0" Style="{StaticResource StatusText}" Text="Ready."/>
-                <TextBlock x:Name="TxtDbInfo" Grid.Column="1" Style="{StaticResource StatusText}" Text=""/>
+                <Button x:Name="BtnRecentErrors" Grid.Column="1" Content="Recent errors (0)"
+                        Padding="6,1" Margin="8,0" Visibility="Collapsed"
+                        ToolTip="Open the session error log"/>
+                <TextBlock x:Name="TxtDbInfo" Grid.Column="2" Style="{StaticResource StatusText}" Text=""/>
             </Grid>
         </Border>
 

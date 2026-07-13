@@ -346,17 +346,20 @@ $controls.BtnExportCsv.Add_Click({
     $rows = @($view.Controls.GrdReachable.ItemsSource)
     if ($rows.Count -gt 0) {
         $dialog = [System.Windows.Forms.SaveFileDialog]::new()
-        $dialog.Filter = 'CSV (*.csv)|*.csv'
-        $safeName = ($view.PrincipalName -replace '[\\/:*?"<>|]', '_')
-        $dialog.FileName = "AccountView_$($safeName)_scan$($view.App.CurrentScanId).csv"
+        try {
+            $dialog.Filter = 'CSV (*.csv)|*.csv'
+            $safeName = ($view.PrincipalName -replace '[\\/:*?"<>|]', '_')
+            $dialog.FileName = "AccountView_$($safeName)_scan$($view.App.CurrentScanId).csv"
 
-        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $rows |
-                Select-Object -Property @('Path', 'Rights', 'AceType', 'Inherited', 'ViaSummary') |
-                Export-Csv -NoTypeInformation -Path $dialog.FileName -Encoding UTF8
-            $view.App.SetStatus("Exported to $($dialog.FileName)")
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $rows |
+                    Select-Object -Property @('Path', 'Rights', 'AceType', 'Inherited', 'ViaSummary') |
+                    Export-Csv -NoTypeInformation -Path $dialog.FileName -Encoding UTF8
+                $view.App.SetStatus("Exported to $($dialog.FileName)")
+            }
+        } finally {
+            $dialog.Dispose()
         }
-        $dialog.Dispose()
     }
 })
 

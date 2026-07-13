@@ -29,14 +29,17 @@
         <!-- Catalogue + detail split -->
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="320"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="5"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
             <!-- Catalogue -->
             <ListBox x:Name="LstFindings" Grid.Column="0"
-                     HorizontalContentAlignment="Stretch">
+                     MinWidth="320" MaxWidth="480"
+                     HorizontalContentAlignment="Stretch"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto">
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <Grid Margin="2,4">

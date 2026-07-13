@@ -1,3 +1,16 @@
+== ShareAcl v1.0-RC1 - 2026-07-13 ==
+
+New features:
+- Added a clickable Recent errors indicator and bounded session log viewer with timestamps, sources, details, copy, and clear actions.
+
+Improvements:
+- Folder CSV exports now include trustee/ACE details, with parent-reference rows for inherited folders and separate rows for explicit ACEs.
+- Folder view and its CSV export now label inheritance originating above the scan root as "Parent out of scope".
+- Improved Findings catalogue sizing.
+- Improved principal picker interaction with automatic search focus and double-click selection.
+- Reworked the Account view controls into responsive principal and filter rows.
+- Tightened disposal of SQLite commands and transactions, async timers and runspaces, child processes and event subscriptions, XAML readers, and native file/folder dialogs.
+
 == ShareAcl v0.9 - 2026-07-10 ==
 
 New features:

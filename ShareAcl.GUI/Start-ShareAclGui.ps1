@@ -20,6 +20,25 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 # in the same PowerShell session. Idempotent — safe on the first run too.
 if ($Script:App) {
     try {
+        foreach ($operation in @($Script:App.AsyncOperations.Values)) {
+            if ($null -ne $operation.Timer) {
+                try { $operation.Timer.Stop() } catch { }
+                if ($null -ne $operation.TimerHandler) {
+                    try { $operation.Timer.Remove_Tick($operation.TimerHandler) } catch { }
+                }
+            }
+            if ($null -ne $operation.PowerShell) {
+                try { $operation.PowerShell.Stop() } catch { }
+                try { $operation.PowerShell.Dispose() } catch { }
+            }
+            if ($null -ne $operation.Runspace) {
+                try { $operation.Runspace.Close() } catch { }
+                try { $operation.Runspace.Dispose() } catch { }
+            }
+        }
+        $Script:App.AsyncOperations.Clear()
+    } catch { }
+    try {
         if ($Script:App.PageHost) { $Script:App.PageHost.Content = $null }
     } catch { }
     try {
@@ -62,6 +81,8 @@ $Script:App = [pscustomobject]@{
     CurrentPage     = $null
     Window          = $null
     StatusBar       = $null
+    ErrorIndicator  = $null
+    ErrorLog        = [System.Collections.ArrayList]::new()
     DbInfo          = $null
     PageHost        = $null
     BusyOverlay     = $null
@@ -92,7 +113,25 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name SetStatus -Value {
 }
 
 $Script:App | Add-Member -MemberType ScriptMethod -Name ShowError -Value {
-    param([string]$Title, [string]$Message)
+    param([string]$Title, [string]$Message, [string]$Details, [string]$Source)
+    if ([string]::IsNullOrWhiteSpace($Source)) { $Source = $Title }
+    if ([string]::IsNullOrWhiteSpace($Details)) { $Details = $Message }
+    $detailLimit = 32768
+    $truncationNotice = "`r`n[truncated at 32 KiB]"
+    if ($Details.Length -gt $detailLimit) {
+        $Details = $Details.Substring(0, $detailLimit - $truncationNotice.Length) + $truncationNotice
+    }
+    [void]$this.ErrorLog.Add([pscustomobject]@{
+        Timestamp = [datetime]::Now
+        Source = $Source
+        Summary = $Message
+        Details = $Details
+    })
+    while ($this.ErrorLog.Count -gt 500) { $this.ErrorLog.RemoveAt(0) }
+    if ($null -ne $this.ErrorIndicator) {
+        $this.ErrorIndicator.Content = "Recent errors ($($this.ErrorLog.Count))"
+        $this.ErrorIndicator.Visibility = [System.Windows.Visibility]::Visible
+    }
     $owner = $this.Window
     if ($null -ne $owner) {
         [System.Windows.MessageBox]::Show($owner, $Message, $Title, 'OK', 'Error') | Out-Null
@@ -100,6 +139,63 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name ShowError -Value {
         [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Error') | Out-Null
     }
     if ($null -ne $this.StatusBar) { $this.StatusBar.Text = $Message }
+}
+
+function Show-SessionErrorLog {
+    $app = $Script:App
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Recent errors"
+        Height="560" Width="900" MinHeight="400" MinWidth="700"
+        WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="12">
+  <Grid Margin="10">
+    <Grid.RowDefinitions><RowDefinition Height="2*"/><RowDefinition Height="5"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <DataGrid x:Name="GrdErrors" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single" CanUserAddRows="False" RowHeaderWidth="0">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Time" Binding="{Binding Timestamp, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="145"/>
+        <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="180"/>
+        <DataGridTextColumn Header="Summary" Binding="{Binding Summary}" Width="*"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" Background="#DDD"/>
+    <TextBox x:Name="TxtDetails" Grid.Row="2" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+      <Button x:Name="BtnCopy" Content="Copy selected" IsEnabled="False" Width="90" Margin="0,0,6,0"/>
+      <Button x:Name="BtnClear" Content="Clear log" Width="70" Margin="0,0,6,0"/>
+      <Button x:Name="BtnClose" Content="Close" Width="70" IsCancel="True"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    try {
+        $win = [System.Windows.Markup.XamlReader]::Load($reader)
+    } finally {
+        $reader.Dispose()
+    }
+    $win.Owner = $app.Window
+    $grid = $win.FindName('GrdErrors'); $details = $win.FindName('TxtDetails')
+    $copy = $win.FindName('BtnCopy'); $clear = $win.FindName('BtnClear')
+    $grid.ItemsSource = @($app.ErrorLog)
+    $grid.Add_SelectionChanged({
+        $row = $grid.SelectedItem
+        $details.Text = if ($null -ne $row) { [string]$row.Details } else { '' }
+        $copy.IsEnabled = ($null -ne $row)
+    })
+    $copy.Add_Click({
+        $row = $grid.SelectedItem
+        if ($null -ne $row) {
+            [System.Windows.Clipboard]::SetText(("Time: {0:yyyy-MM-dd HH:mm:ss}`r`nSource: {1}`r`nSummary: {2}`r`n`r`n{3}" -f $row.Timestamp, $row.Source, $row.Summary, $row.Details))
+        }
+    })
+    $clear.Add_Click({
+        $app.ErrorLog.Clear(); $grid.ItemsSource = @(); $details.Text = ''; $copy.IsEnabled = $false
+        $app.ErrorIndicator.Content = 'Recent errors (0)'
+        $app.ErrorIndicator.Visibility = [System.Windows.Visibility]::Collapsed
+    })
+    $win.FindName('BtnClose').Add_Click({ $win.Close() })
+    [void]$win.ShowDialog()
+    $win.Owner = $null
 }
 
 $Script:App | Add-Member -MemberType ScriptMethod -Name GetControls -Value {
@@ -158,15 +254,25 @@ function Hide-AppBusy {
 function Remove-AppOperationReference {
     param($App, $Operation)
 
+    if ($null -eq $Operation) { return }
+
     $owner = $Operation.Owner
-    if ($null -ne $owner -and $owner.Operations.ContainsKey($Operation.Name)) {
-        $registered = $owner.Operations[$Operation.Name]
+    $name = [string]$Operation.Name
+    $id = [string]$Operation.Id
+    if ($null -ne $owner -and
+        $null -ne $owner.Operations -and
+        -not [string]::IsNullOrWhiteSpace($name) -and
+        $owner.Operations.ContainsKey($name)) {
+        $registered = $owner.Operations[$name]
         if ([object]::ReferenceEquals($registered, $Operation)) {
-            [void]$owner.Operations.Remove($Operation.Name)
+            [void]$owner.Operations.Remove($name)
         }
     }
-    if ($null -ne $App -and $App.AsyncOperations.ContainsKey($Operation.Id)) {
-        [void]$App.AsyncOperations.Remove($Operation.Id)
+    if ($null -ne $App -and
+        $null -ne $App.AsyncOperations -and
+        -not [string]::IsNullOrWhiteSpace($id) -and
+        $App.AsyncOperations.ContainsKey($id)) {
+        [void]$App.AsyncOperations.Remove($id)
     }
 }
 
@@ -175,8 +281,12 @@ function Close-AppAsyncResources {
 
     if ($null -ne $Operation.Timer) {
         try { $Operation.Timer.Stop() } catch { }
+        if ($null -ne $Operation.TimerHandler) {
+            try { $Operation.Timer.Remove_Tick($Operation.TimerHandler) } catch { }
+        }
         $Operation.Timer = $null
     }
+    $Operation.TimerHandler = $null
     if ($null -ne $Operation.PowerShell) {
         try { $Operation.PowerShell.Dispose() } catch { }
         $Operation.PowerShell = $null
@@ -211,12 +321,17 @@ function Complete-AppAsyncOperation {
             $wrapped = [pscustomobject]@{
                 Ok    = $false
                 Error = $_.Exception.Message
+                Details = $_.Exception.ToString()
             }
         }
 
-        $owner    = $Operation.Owner
-        $ownsSlot = $owner.Operations.ContainsKey($Operation.Name) -and
-                    [object]::ReferenceEquals($owner.Operations[$Operation.Name], $Operation)
+        $owner = $Operation.Owner
+        $name = [string]$Operation.Name
+        $ownsSlot = $null -ne $owner -and
+                    $null -ne $owner.Operations -and
+                    -not [string]::IsNullOrWhiteSpace($name) -and
+                    $owner.Operations.ContainsKey($name) -and
+                    [object]::ReferenceEquals($owner.Operations[$name], $Operation)
 
         Close-AppAsyncResources -Operation $Operation
         Remove-AppOperationReference -App $App -Operation $Operation
@@ -229,14 +344,24 @@ function Complete-AppAsyncOperation {
         if ($canApply) {
             if ($wrapped.Ok) {
                 try {
-                    & $Operation.OnComplete $wrapped.Result $owner
+                    $callbackResult = if (
+                        $null -ne $wrapped.PSObject.Properties['ResultCount'] -and
+                        [int]$wrapped.ResultCount -eq 0
+                    ) {
+                        [object[]]@()
+                    } else {
+                        $wrapped.Result
+                    }
+                    & $Operation.OnComplete $callbackResult $owner
                 } catch {
                     $App.ShowError('Background completion failed', $_.Exception.Message)
                 }
             } else {
-                $App.ShowError($Operation.ErrorTitle, [string]$wrapped.Error)
+                $App.ShowError($Operation.ErrorTitle, [string]$wrapped.Error, [string]$wrapped.Details, $Operation.Name)
             }
         }
+        $Operation.OnComplete = $null
+        $Operation.Owner = $null
     }
 }
 
@@ -259,6 +384,8 @@ function Stop-AppOperationInstance {
             Close-AppAsyncResources -Operation $Operation
             Remove-AppOperationReference -App $App -Operation $Operation
             Hide-AppBusy -App $App -OperationId $Operation.Id
+            $Operation.OnComplete = $null
+            $Operation.Owner = $null
         } elseif (-not $Operation.CancelRequested) {
             $Operation.CancelRequested = $true
             try {
@@ -278,7 +405,10 @@ function Stop-AppAsyncOperation {
         [switch]$Synchronous
     )
 
-    if ($null -ne $PageContext -and $PageContext.Operations.ContainsKey($Name)) {
+    if ($null -ne $PageContext -and
+        $null -ne $PageContext.Operations -and
+        -not [string]::IsNullOrWhiteSpace($Name) -and
+        $PageContext.Operations.ContainsKey($Name)) {
         $operation = $PageContext.Operations[$Name]
         Stop-AppOperationInstance -App $App -Operation $operation -Synchronous:$Synchronous
     }
@@ -340,6 +470,7 @@ function Start-AppAsyncOperation {
             Runspace        = $null
             Handle          = $null
             Timer           = $null
+            TimerHandler    = $null
             OnComplete      = $OnComplete
             ErrorTitle      = $ErrorTitle
             CancelRequested = $false
@@ -370,15 +501,24 @@ param($Ctx, $WorkerText)
 $ErrorActionPreference = 'Stop'
 try {
     $worker = [scriptblock]::Create($WorkerText)
-    $result = & $worker $Ctx
+    $results = @(& $worker $Ctx)
+    $result = if ($results.Count -eq 0) {
+        [object[]]@()
+    } elseif ($results.Count -eq 1) {
+        $results[0]
+    } else {
+        $results
+    }
     [pscustomobject]@{
-        Ok     = $true
-        Result = $result
+        Ok          = $true
+        ResultCount = $results.Count
+        Result      = $result
     }
 } catch {
     [pscustomobject]@{
         Ok    = $false
         Error = $_.Exception.Message
+        Details = ($_ | Out-String)
     }
 }
 '@
@@ -397,39 +537,37 @@ try {
         $appReference       = $App
         $operationReference = $operation
         $completionCommand  = $App.Commands.CompleteAsync
-        $timer.Add_Tick({
-            if ($operationReference.Handle.IsCompleted) {
+        $closeResourcesCommand = $App.Commands.CloseAsyncResources
+        $removeReferenceCommand = $App.Commands.RemoveAsyncReference
+        $hideBusyCommand = $App.Commands.HideBusy
+        $timerHandlerScript = {
+            if ($null -ne $operationReference.Handle -and $operationReference.Handle.IsCompleted) {
                 try {
                     & $completionCommand -App $appReference -Operation $operationReference
                 } catch {
+                    $completionError = $_
                     # This is a last-resort guard for the completion mechanism
                     # itself. Never leave the overlay spinning indefinitely.
                     $operationReference.Completed = $true
-                    try { $operationReference.Timer.Stop() } catch { }
-                    try { $operationReference.PowerShell.Dispose() } catch { }
-                    try { $operationReference.Runspace.Close() } catch { }
-                    try { $operationReference.Runspace.Dispose() } catch { }
-
-                    $owner = $operationReference.Owner
-                    if ($owner.Operations.ContainsKey($operationReference.Name) -and
-                        [object]::ReferenceEquals(
-                            $owner.Operations[$operationReference.Name],
-                            $operationReference
-                        )) {
-                        [void]$owner.Operations.Remove($operationReference.Name)
-                    }
-                    [void]$appReference.AsyncOperations.Remove($operationReference.Id)
-                    if ($appReference.BusyOperationId -eq $operationReference.Id) {
-                        $appReference.BusyOperationId = $null
-                        $appReference.BusyOverlay.Visibility = [System.Windows.Visibility]::Collapsed
-                    }
-                    $appReference.ShowError(
-                        'Async completion failed',
-                        $_.Exception.Message
-                    )
+                    try { & $closeResourcesCommand -Operation $operationReference } catch { }
+                    try { & $removeReferenceCommand -App $appReference -Operation $operationReference } catch { }
+                    try { & $hideBusyCommand -App $appReference -OperationId ([string]$operationReference.Id) } catch { }
+                    $operationReference.OnComplete = $null
+                    $operationReference.Owner = $null
+                    try {
+                        $appReference.ShowError(
+                            'Async completion failed',
+                            $completionError.Exception.Message,
+                            $completionError.Exception.ToString(),
+                            [string]$operationReference.Name
+                        )
+                    } catch { }
                 }
             }
-        }.GetNewClosure())
+        }.GetNewClosure()
+        $timerHandler = [System.EventHandler]$timerHandlerScript
+        $operation.TimerHandler = $timerHandler
+        $timer.Add_Tick($timerHandler)
         $timer.Start()
     } catch {
         if ($null -ne $operation) {
@@ -438,7 +576,7 @@ try {
             Remove-AppOperationReference -App $App -Operation $operation
             Hide-AppBusy -App $App -OperationId $operation.Id
         }
-        $App.ShowError('Unable to start background operation', $_.Exception.Message)
+        $App.ShowError('Unable to start background operation', $_.Exception.Message, $_.Exception.ToString(), $Name)
         $operation = $null
     }
 
@@ -805,7 +943,11 @@ function Show-PrincipalPicker {
 "@
 
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-    $win    = [System.Windows.Markup.XamlReader]::Load($reader)
+    try {
+        $win = [System.Windows.Markup.XamlReader]::Load($reader)
+    } finally {
+        $reader.Dispose()
+    }
     $win.Owner = $Script:App.Window
 
     $rbDb         = $win.FindName('RbDb')
@@ -873,21 +1015,35 @@ function Show-PrincipalPicker {
     $rbDb.Add_Click({ if ($txt.Text.Trim()) { & $doSearch } })
     $rbAd.Add_Click({ if ($txt.Text.Trim()) { & $doSearch } })
 
-    $script:result = $null
-    $ok.Add_Click({
-        if ($grd.SelectedItem) {
-            $script:result = @{
-                Sid  = $grd.SelectedItem.Sid
-                Name = $grd.SelectedItem.Name
-                Sam  = $grd.SelectedItem.Sam
-                Type = $grd.SelectedItem.Type
+    $acceptSelection = {
+        param($sender, $eventArgs)
+        $dialog = [System.Windows.Window]::GetWindow($sender)
+        $results = if ($null -ne $dialog) { $dialog.FindName('GrdResults') } else { $null }
+        if ($null -ne $results -and $null -ne $results.SelectedItem) {
+            $dialog.Tag = [pscustomobject]@{
+                Sid  = $results.SelectedItem.Sid
+                Name = $results.SelectedItem.Name
+                Sam  = $results.SelectedItem.Sam
+                Type = $results.SelectedItem.Type
             }
-            $win.DialogResult = $true
-            $win.Close()
+            # Assigning DialogResult closes a modal WPF window; an additional
+            # Close() call can race the dialog teardown in event callbacks.
+            $dialog.DialogResult = $true
+        }
+    }
+    $ok.Add_Click($acceptSelection)
+    $grd.Add_MouseDoubleClick($acceptSelection)
+    $win.Add_ContentRendered({
+        param($sender, $eventArgs)
+        $search = $sender.FindName('TxtSearch')
+        if ($null -ne $search) {
+            [void]$search.Focus()
+            [System.Windows.Input.Keyboard]::Focus($search) | Out-Null
         }
     })
 
     [void]$win.ShowDialog()
+    $captured = $win.Tag
 
     # Release control references and event handlers so the window is fully collectible
     try {
@@ -897,8 +1053,6 @@ function Show-PrincipalPicker {
     } catch { }
     $win = $null
 
-    $captured = $script:result
-    $script:result = $null
     return $captured
 }
 
@@ -909,12 +1063,15 @@ function Show-PrincipalPicker {
 function New-ShareAclDatabase {
     param([switch]$SkipScanPrompt)
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Title    = 'Create ShareACL database'
-    $dlg.Filter   = 'ShareACL database (*.db)|*.db'
-    $dlg.FileName = 'shareacl.db'
-    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
-
-    $target = $dlg.FileName
+    try {
+        $dlg.Title    = 'Create ShareACL database'
+        $dlg.Filter   = 'ShareACL database (*.db)|*.db'
+        $dlg.FileName = 'shareacl.db'
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $target = $dlg.FileName
+    } finally {
+        $dlg.Dispose()
+    }
 
     if (Test-Path $target) {
         $ans = [System.Windows.MessageBox]::Show(
@@ -1030,8 +1187,7 @@ function Show-RunResolverDialog {
     $xamlPath = Join-Path $Script:PagesRoot 'RunResolverDialog.xaml'
     if (-not (Test-Path $xamlPath)) { throw "Dialog XAML missing: $xamlPath" }
 
-    $reader = [System.Xml.XmlReader]::Create($xamlPath)
-    $win    = [System.Windows.Markup.XamlReader]::Load($reader)
+    $win = Import-WpfXamlFile -Path $xamlPath
     $win.Owner = $app.Window
 
     $rbAllSids     = $win.FindName('RbAllSids')
@@ -1058,11 +1214,38 @@ function Show-RunResolverDialog {
 
     $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
     $dlgState = @{
-        Proc         = $null
-        Phase        = 'idle'
-        StdoutRegId  = $null
-        StderrRegId  = $null
+        Proc       = $null
+        Phase      = 'idle'
+        StdoutReg  = $null
+        StderrReg  = $null
     }
+
+    $cleanupResolverProcess = {
+        param([bool]$Terminate)
+
+        foreach ($key in 'StdoutReg','StderrReg') {
+            $registration = $dlgState[$key]
+            if ($null -ne $registration) {
+                try { Unregister-Event -SourceIdentifier $registration.Name -ErrorAction SilentlyContinue } catch { }
+                try { Remove-Job -Job $registration -Force -ErrorAction SilentlyContinue } catch { }
+                $dlgState[$key] = $null
+            }
+        }
+
+        $process = $dlgState.Proc
+        if ($null -ne $process) {
+            if ($Terminate -and -not $process.HasExited) {
+                try { $process.Kill() } catch { }
+            }
+            if (-not $process.HasExited) {
+                try { [void]$process.WaitForExit(2000) } catch { }
+            }
+            try { $process.CancelOutputRead() } catch { }
+            try { $process.CancelErrorRead() } catch { }
+            try { $process.Dispose() } catch { }
+            $dlgState.Proc = $null
+        }
+    }.GetNewClosure()
 
     $drainQueue = {
         $line = $null
@@ -1136,24 +1319,19 @@ function Show-RunResolverDialog {
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [System.TimeSpan]::FromMilliseconds(100)
-    $timer.Add_Tick({
+    $resolverTimerTickScript = {
         & $drainQueue
         if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
             $timer.Stop()
-            if ($dlgState.StdoutRegId) {
-                try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
-                $dlgState.StdoutRegId = $null
-            }
-            if ($dlgState.StderrRegId) {
-                try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
-                $dlgState.StderrRegId = $null
-            }
             $exitCode = $dlgState.Proc.ExitCode
             Start-Sleep -Milliseconds 100
             & $drainQueue
+            & $cleanupResolverProcess $false
             & $onResolverExit $exitCode
         }
-    }.GetNewClosure())
+    }.GetNewClosure()
+    $resolverTimerTick = [System.EventHandler]$resolverTimerTickScript
+    $timer.Add_Tick($resolverTimerTick)
 
     $btnStart.Add_Click({
         $dlgState.Phase = 'running'
@@ -1197,6 +1375,7 @@ function Show-RunResolverDialog {
 
         $proc = New-Object System.Diagnostics.Process
         $proc.StartInfo = $psi
+        $dlgState.Proc = $proc
 
         $stdoutReg = Register-ObjectEvent -InputObject $proc `
             -EventName OutputDataReceived `
@@ -1204,6 +1383,7 @@ function Show-RunResolverDialog {
             -Action {
                 if ($EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) }
             }
+        $dlgState.StdoutReg = $stdoutReg
         $stderrReg = Register-ObjectEvent -InputObject $proc `
             -EventName ErrorDataReceived `
             -MessageData $outputQueue `
@@ -1221,14 +1401,12 @@ function Show-RunResolverDialog {
                 if ($line -match '^</?Objs>')  { return }
                 $Event.MessageData.Enqueue("STDERR: $line")
             }
+        $dlgState.StderrReg = $stderrReg
 
         [void]$proc.Start()
         $proc.BeginOutputReadLine()
         $proc.BeginErrorReadLine()
 
-        $dlgState.Proc        = $proc
-        $dlgState.StdoutRegId = $stdoutReg.Id
-        $dlgState.StderrRegId = $stderrReg.Id
         $timer.Start()
     }.GetNewClosure())
 
@@ -1242,21 +1420,15 @@ function Show-RunResolverDialog {
 
     $win.Add_Closed({
         try { $timer.Stop() } catch { }
-        if ($dlgState.StdoutRegId) {
-            try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
-        }
-        if ($dlgState.StderrRegId) {
-            try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
-        }
-        try {
-            if ($dlgState.Proc -and -not $dlgState.Proc.HasExited) {
-                try { $dlgState.Proc.Kill() } catch { }
-            }
-            if ($dlgState.Proc) { try { $dlgState.Proc.Dispose() } catch { } }
-        } catch { }
+        try { $timer.Remove_Tick($resolverTimerTick) } catch { }
+        & $cleanupResolverProcess $true
     }.GetNewClosure())
 
-    [void]$win.ShowDialog()
+    try {
+        [void]$win.ShowDialog()
+    } finally {
+        $win.Owner = $null
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -1275,8 +1447,7 @@ function Show-NewScanDialog {
     $xamlPath = Join-Path $Script:PagesRoot 'NewScanDialog.xaml'
     if (-not (Test-Path $xamlPath)) { throw "Dialog XAML missing: $xamlPath" }
 
-    $reader = [System.Xml.XmlReader]::Create($xamlPath)
-    $win    = [System.Windows.Markup.XamlReader]::Load($reader)
+    $win = Import-WpfXamlFile -Path $xamlPath
     $win.Owner = $Script:App.Window
 
     $txtRoots         = $win.FindName('TxtRoots')
@@ -1316,10 +1487,37 @@ function Show-NewScanDialog {
         Phase         = 'idle'      # idle | collecting | resolving | done | cancelled
         RunResolver   = $false
         OnExit        = $null       # scriptblock invoked on UI thread when process exits
-        StdoutRegId   = $null       # event subscription IDs for cleanup
-        StderrRegId   = $null
+        StdoutReg     = $null       # event jobs for cleanup
+        StderrReg     = $null
         TickCount     = 0           # for throttling UI updates
     }
+
+    $cleanupScanProcess = {
+        param([bool]$Terminate)
+
+        foreach ($key in 'StdoutReg','StderrReg') {
+            $registration = $dlgState[$key]
+            if ($null -ne $registration) {
+                try { Unregister-Event -SourceIdentifier $registration.Name -ErrorAction SilentlyContinue } catch { }
+                try { Remove-Job -Job $registration -Force -ErrorAction SilentlyContinue } catch { }
+                $dlgState[$key] = $null
+            }
+        }
+
+        $process = $dlgState.Proc
+        if ($null -ne $process) {
+            if ($Terminate -and -not $process.HasExited) {
+                try { $process.Kill() } catch { }
+            }
+            if (-not $process.HasExited) {
+                try { [void]$process.WaitForExit(2000) } catch { }
+            }
+            try { $process.CancelOutputRead() } catch { }
+            try { $process.CancelErrorRead() } catch { }
+            try { $process.Dispose() } catch { }
+            $dlgState.Proc = $null
+        }
+    }.GetNewClosure()
 
     # --- UI-thread helpers (no dispatcher marshalling needed) ---
 
@@ -1465,7 +1663,7 @@ function Show-NewScanDialog {
     # --- DispatcherTimer: drains output and polls process exit on the UI thread ---
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(100)
-    $timer.Add_Tick({
+    $scanTimerTickScript = {
         & $drainQueue
     
         $dlgState.TickCount++
@@ -1474,19 +1672,10 @@ function Show-NewScanDialog {
         if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
             $timer.Stop()
 
-            # Unregister event subscriptions so they don't leak across runs
-            if ($dlgState.StdoutRegId) {
-                try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
-                $dlgState.StdoutRegId = $null
-            }
-            if ($dlgState.StderrRegId) {
-                try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
-                $dlgState.StderrRegId = $null
-            }
-            
             $exitCode = $dlgState.Proc.ExitCode
             Start-Sleep -Milliseconds 100
             & $drainQueue
+            & $cleanupScanProcess $false
 
             
             # Final poll to catch the last progress update, then hide the bar
@@ -1495,7 +1684,9 @@ function Show-NewScanDialog {
 
             & $onScanExit $exitCode
         }
-    }.GetNewClosure())
+    }.GetNewClosure()
+    $scanTimerTick = [System.EventHandler]$scanTimerTickScript
+    $timer.Add_Tick($scanTimerTick)
 
     # --- Start button ---
     $btnStart.Add_Click({
@@ -1596,6 +1787,7 @@ function Show-NewScanDialog {
 
         $proc = New-Object System.Diagnostics.Process
         $proc.StartInfo = $psi
+        $dlgState.Proc = $proc
 
         $stdoutReg = Register-ObjectEvent -InputObject $proc `
             -EventName OutputDataReceived `
@@ -1603,6 +1795,7 @@ function Show-NewScanDialog {
             -Action {
                 if ($EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) }
             }
+        $dlgState.StdoutReg = $stdoutReg
         $stderrReg = Register-ObjectEvent -InputObject $proc `
             -EventName ErrorDataReceived `
             -MessageData $outputQueue `
@@ -1620,14 +1813,12 @@ function Show-NewScanDialog {
                 if ($line -match '^</?Objs>')  { return }
                 $Event.MessageData.Enqueue("STDERR: $line")
             }
+        $dlgState.StderrReg = $stderrReg
 
         [void]$proc.Start()
         $proc.BeginOutputReadLine()
         $proc.BeginErrorReadLine()
 
-        $dlgState.Proc        = $proc
-        $dlgState.StdoutRegId = $stdoutReg.Id
-        $dlgState.StderrRegId = $stderrReg.Id
         $timer.Start()
         & $pollProgress
     }.GetNewClosure())
@@ -1642,9 +1833,13 @@ function Show-NewScanDialog {
 
     $btnBrowse.Add_Click({
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            if ($txtRoots.Text.TrimEnd() -ne '') { $txtRoots.AppendText("`r`n") }
-            $txtRoots.AppendText($dlg.SelectedPath)
+        try {
+            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                if ($txtRoots.Text.TrimEnd() -ne '') { $txtRoots.AppendText("`r`n") }
+                $txtRoots.AppendText($dlg.SelectedPath)
+            }
+        } finally {
+            $dlg.Dispose()
         }
     }.GetNewClosure())
 
@@ -1675,21 +1870,15 @@ function Show-NewScanDialog {
 
     $win.Add_Closed({
         try { $timer.Stop() } catch { }
-        if ($dlgState.StdoutRegId) {
-            try { Unregister-Event -SubscriptionId $dlgState.StdoutRegId -ErrorAction SilentlyContinue } catch { }
-        }
-        if ($dlgState.StderrRegId) {
-            try { Unregister-Event -SubscriptionId $dlgState.StderrRegId -ErrorAction SilentlyContinue } catch { }
-        }
-        try {
-            if ($dlgState.Proc -and -not $dlgState.Proc.HasExited) {
-                try { $dlgState.Proc.Kill() } catch { }
-            }
-            if ($dlgState.Proc) { try { $dlgState.Proc.Dispose() } catch { } }
-        } catch { }
+        try { $timer.Remove_Tick($scanTimerTick) } catch { }
+        & $cleanupScanProcess $true
     }.GetNewClosure())
 
-    [void]$win.ShowDialog()
+    try {
+        [void]$win.ShowDialog()
+    } finally {
+        $win.Owner = $null
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -1756,7 +1945,7 @@ function Navigate-Page {
         }
         $Script:App.CurrentPageName = $null
         $Script:App.CurrentPage     = $null
-        $Script:App.ShowError('Page load failed', $_.Exception.Message)
+        $Script:App.ShowError('Page load failed', $_.Exception.Message, $_.Exception.ToString(), $PageName)
     }
 }
 
@@ -1799,6 +1988,9 @@ function Set-NavEnabled {
 $Script:App.Commands = [pscustomobject]@{
     StartAsync      = (Get-Item -LiteralPath 'Function:\Start-AppAsyncOperation').ScriptBlock
     CompleteAsync   = (Get-Item -LiteralPath 'Function:\Complete-AppAsyncOperation').ScriptBlock
+    CloseAsyncResources = (Get-Item -LiteralPath 'Function:\Close-AppAsyncResources').ScriptBlock
+    RemoveAsyncReference = (Get-Item -LiteralPath 'Function:\Remove-AppOperationReference').ScriptBlock
+    HideBusy        = (Get-Item -LiteralPath 'Function:\Hide-AppBusy').ScriptBlock
     StopOperation   = (Get-Item -LiteralPath 'Function:\Stop-AppAsyncOperation').ScriptBlock
     StopPage        = (Get-Item -LiteralPath 'Function:\Stop-AppPageOperations').ScriptBlock
     StopAll         = (Get-Item -LiteralPath 'Function:\Stop-AllAppOperations').ScriptBlock
@@ -1814,6 +2006,7 @@ $Script:App.Commands = [pscustomobject]@{
     ResolverDialog  = (Get-Item -LiteralPath 'Function:\Show-RunResolverDialog').ScriptBlock
     NewDatabase     = (Get-Item -LiteralPath 'Function:\New-ShareAclDatabase').ScriptBlock
     NewScanDialog   = (Get-Item -LiteralPath 'Function:\Show-NewScanDialog').ScriptBlock
+    ShowErrorLog    = (Get-Item -LiteralPath 'Function:\Show-SessionErrorLog').ScriptBlock
 }
 
 # -----------------------------------------------------------------------------
@@ -1826,11 +2019,18 @@ $window = Import-WpfXamlFile -Path $xamlPath
 
 $Script:App.Window      = $window
 $Script:App.StatusBar   = $window.FindName('TxtStatus')
+$Script:App.ErrorIndicator = $window.FindName('BtnRecentErrors')
 $Script:App.DbInfo      = $window.FindName('TxtDbInfo')
 $Script:App.PageHost    = $window.FindName('PageHost')
 $Script:App.BusyOverlay = $window.FindName('BusyOverlay')
 $Script:App.BusyText    = $window.FindName('BusyText')
 $window.DataContext     = $Script:App
+
+$Script:App.ErrorIndicator.Add_Click({
+    param($sender, $eventArgs)
+    $command = $sender.DataContext.Commands.ShowErrorLog
+    & $command
+})
 
 foreach ($name in 'NavFolder','NavAccount','NavFindings','NavSwap','NavNewDb','NavCollect','NavResolve') {
     $Script:App.NavButtons[$name] = $window.FindName($name)
@@ -1842,11 +2042,14 @@ $window.FindName('BtnBrowseDb').Add_Click({
 
     $app = $sender.DataContext
     $dialog = [System.Windows.Forms.OpenFileDialog]::new()
-    $dialog.Filter = 'ShareACL database (*.db)|*.db|All files (*.*)|*.*'
-    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $app.Window.FindName('TxtDbPath').Text = $dialog.FileName
+    try {
+        $dialog.Filter = 'ShareACL database (*.db)|*.db|All files (*.*)|*.*'
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $app.Window.FindName('TxtDbPath').Text = $dialog.FileName
+        }
+    } finally {
+        $dialog.Dispose()
     }
-    $dialog.Dispose()
 })
 
 $window.FindName('BtnOpenDb').Add_Click({
@@ -1862,7 +2065,7 @@ $window.FindName('BtnOpenDb').Add_Click({
         & $refreshScans
         & $setNavigation -Enabled $true
     } catch {
-        $app.ShowError('Open database failed', $_.Exception.Message)
+        $app.ShowError('Open database failed', $_.Exception.Message, $_.Exception.ToString(), 'Open database')
     }
 })
 
@@ -1989,8 +2192,13 @@ try {
     $Script:App.Window          = $null
     $Script:App.PageHost        = $null
     $Script:App.StatusBar       = $null
+    $Script:App.ErrorIndicator  = $null
     $Script:App.DbInfo          = $null
+    $Script:App.BusyOverlay     = $null
+    $Script:App.BusyText        = $null
     $Script:App.NavContext      = $null
     $Script:App.CurrentPage     = $null
     $Script:App.CurrentPageName = $null
+    $Script:App.ErrorLog.Clear()
+    $Script:App.AsyncOperations.Clear()
 }

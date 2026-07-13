@@ -640,13 +640,17 @@ $btnPickTarget.Add_Click({
 
 $btnBrowseScope.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Pick the scope root for the substitution'
-    if (-not [string]::IsNullOrWhiteSpace($txtScope.Text)) {
-        $dlg.SelectedPath = $txtScope.Text
-    }
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $txtScope.Text = $dlg.SelectedPath
-        & $invalidatePreview
+    try {
+        $dlg.Description = 'Pick the scope root for the substitution'
+        if (-not [string]::IsNullOrWhiteSpace($txtScope.Text)) {
+            $dlg.SelectedPath = $txtScope.Text
+        }
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $txtScope.Text = $dlg.SelectedPath
+            & $invalidatePreview
+        }
+    } finally {
+        $dlg.Dispose()
     }
 }.GetNewClosure())
 

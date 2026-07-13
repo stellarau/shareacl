@@ -118,8 +118,10 @@ function Update-ScanProgress {
         [double]  $Rate,
         [datetime]$EtaUtc
     )
-    $cmd = $Conn.CreateCommand()
-    $cmd.CommandText = @"
+    $cmd = $null
+    try {
+        $cmd = $Conn.CreateCommand()
+        $cmd.CommandText = @"
         UPDATE scans SET
             processed_folders        = @p,
             folders_per_second       = @r,
@@ -127,24 +129,32 @@ function Update-ScanProgress {
             last_updated_utc         = @now
          WHERE scan_id = @id
 "@
-    [void]$cmd.Parameters.AddWithValue('@p',   $Processed)
-    [void]$cmd.Parameters.AddWithValue('@r',   $Rate)
-    [void]$cmd.Parameters.AddWithValue('@eta', $EtaUtc.ToString('o'))
-    [void]$cmd.Parameters.AddWithValue('@now', [System.DateTime]::UtcNow.ToString('o'))
-    [void]$cmd.Parameters.AddWithValue('@id',  $ScanId)
-    [void]$cmd.ExecuteNonQuery()
+        [void]$cmd.Parameters.AddWithValue('@p',   $Processed)
+        [void]$cmd.Parameters.AddWithValue('@r',   $Rate)
+        [void]$cmd.Parameters.AddWithValue('@eta', $EtaUtc.ToString('o'))
+        [void]$cmd.Parameters.AddWithValue('@now', [System.DateTime]::UtcNow.ToString('o'))
+        [void]$cmd.Parameters.AddWithValue('@id',  $ScanId)
+        [void]$cmd.ExecuteNonQuery()
+    } finally {
+        if ($null -ne $cmd) { $cmd.Dispose() }
+    }
 }
 
 function Write-ScanError {
     param([System.Data.SQLite.SQLiteConnection]$Conn, [int]$ScanId, [string]$ItemPath, [string]$Phase, [string]$Message)
-    $cmd = $Conn.CreateCommand()
-    $cmd.CommandText = "INSERT INTO scan_errors(scan_id,path,phase,message,logged_utc) VALUES (@s,@p,@ph,@m,@t)"
-    [void]$cmd.Parameters.AddWithValue('@s',  $ScanId)
-    [void]$cmd.Parameters.AddWithValue('@p',  $ItemPath)
-    [void]$cmd.Parameters.AddWithValue('@ph', $Phase)
-    [void]$cmd.Parameters.AddWithValue('@m',  $Message)
-    [void]$cmd.Parameters.AddWithValue('@t',  [DateTime]::UtcNow.ToString('o'))
-    [void]$cmd.ExecuteNonQuery()
+    $cmd = $null
+    try {
+        $cmd = $Conn.CreateCommand()
+        $cmd.CommandText = "INSERT INTO scan_errors(scan_id,path,phase,message,logged_utc) VALUES (@s,@p,@ph,@m,@t)"
+        [void]$cmd.Parameters.AddWithValue('@s',  $ScanId)
+        [void]$cmd.Parameters.AddWithValue('@p',  $ItemPath)
+        [void]$cmd.Parameters.AddWithValue('@ph', $Phase)
+        [void]$cmd.Parameters.AddWithValue('@m',  $Message)
+        [void]$cmd.Parameters.AddWithValue('@t',  [DateTime]::UtcNow.ToString('o'))
+        [void]$cmd.ExecuteNonQuery()
+    } finally {
+        if ($null -ne $cmd) { $cmd.Dispose() }
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -470,8 +480,10 @@ try {
             }
             $tx.Commit()
         } catch {
-            $tx.Rollback()
+            try { $tx.Rollback() } catch { }
             throw
+        } finally {
+            $tx.Dispose()
         }
 
         Write-Host ("  processed {0,8} folders | {1,9} ACEs | {2,4} errors" -f $totalFolders, $totalAces, $totalErrors)
@@ -517,10 +529,14 @@ catch {
     } catch { }
 }
 finally {
-    
-if ($conn -and $conn.State -ne [System.Data.ConnectionState]::Closed) {
-        $conn.Close()
-        $conn.Dispose()
+    foreach ($command in @($insFolder, $insAce, $delPending, $insPending)) {
+        if ($null -ne $command) { try { $command.Dispose() } catch { } }
+    }
+    if ($conn) {
+        if ($conn.State -ne [System.Data.ConnectionState]::Closed) {
+            try { $conn.Close() } catch { }
+        }
+        try { $conn.Dispose() } catch { }
     }
     try {
         Invoke-SqliteQuery -DataSource $Database `

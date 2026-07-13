@@ -30,6 +30,8 @@ $view = [pscustomobject]@{
     RefreshForScan = $null
     ApplyFolders   = $null
     ApplyAces      = $null
+    ExportSql      = $null
+    ExportParams   = $null
 }
 $Page.DataContext  = $view
 $pageContext.State = $view
@@ -38,7 +40,10 @@ $view.ApplyFolders = {
     param($Rows, $Owner)
 
     $view = $Owner.State
-    $items = @($Rows)
+    # A zero-row query must remain an empty collection. Filtering nulls also
+    # protects the DataGrid from malformed provider output being treated as a
+    # selectable blank row.
+    $items = @($Rows | Where-Object { $null -ne $_ })
     $view.Controls.GrdFolders.ItemsSource = $items
     $view.Controls.GrdAces.ItemsSource    = @()
     $view.Controls.BtnExportCsv.IsEnabled = ($items.Count -gt 0)
@@ -49,7 +54,7 @@ $view.ApplyAces = {
     param($Rows, $Owner)
 
     $view = $Owner.State
-    $view.Controls.GrdAces.ItemsSource = @($Rows)
+    $view.Controls.GrdAces.ItemsSource = @($Rows | Where-Object { $null -ne $_ })
 }
 
 $view.LoadFolders = {
@@ -94,6 +99,54 @@ ORDER BY f.path
 LIMIT 5000
 "@
 
+        # Export the same filtered folder set, flattened with the trustee detail.
+        # Scan roots and broken folders produce one row per ACE. Inherited child
+        # folders start with a parent-reference row, followed by every explicit ACE.
+        $View.ExportSql = @"
+WITH selected_folders AS (
+    SELECT f.folder_id, f.path, f.parent_id, f.depth, f.inheritance_enabled, f.explicit_ace_count
+    FROM folders f
+    WHERE $($where -join ' AND ')
+    ORDER BY f.path
+    LIMIT 5000
+), detail_rows AS (
+    SELECT sf.folder_id, sf.path, sf.inheritance_enabled, sf.explicit_ace_count,
+           a.trustee_sid, COALESCE(p.name, a.trustee_sid) AS trustee,
+           a.access_control_type, a.rights_text, a.is_inherited, a.inherited_from,
+           1 AS row_order
+    FROM selected_folders sf
+    JOIN aces a ON a.folder_id = sf.folder_id
+               AND (sf.depth = 0 OR sf.inheritance_enabled = 0 OR a.is_inherited = 0)
+    LEFT JOIN principals p ON p.sid = a.trustee_sid
+), parent_rows AS (
+    SELECT sf.folder_id, sf.path, sf.inheritance_enabled, sf.explicit_ace_count,
+           NULL AS trustee_sid, 'Inherited from parent' AS trustee,
+           NULL AS access_control_type, NULL AS rights_text, 1 AS is_inherited,
+           parent.path AS inherited_from, 0 AS row_order
+    FROM selected_folders sf
+    LEFT JOIN folders parent ON parent.folder_id = sf.parent_id
+    WHERE sf.depth > 0 AND sf.inheritance_enabled = 1
+), export_rows AS (
+    SELECT * FROM parent_rows
+    UNION ALL
+    SELECT * FROM detail_rows
+)
+SELECT er.path AS Path,
+       CASE er.inheritance_enabled WHEN 1 THEN 'Y' ELSE 'N' END AS Inh,
+       er.explicit_ace_count AS Explicit,
+       er.trustee AS Trustee,
+       er.trustee_sid AS Sid,
+       er.access_control_type AS AceType,
+       er.rights_text AS Rights,
+       CASE er.is_inherited WHEN 1 THEN 'Y' ELSE 'N' END AS Inherited,
+       CASE WHEN LOWER(COALESCE(er.inherited_from, '')) LIKE '%unknown paren%'
+            THEN 'Parent out of scope'
+            ELSE COALESCE(er.inherited_from, '') END AS InheritedFrom
+FROM export_rows er
+ORDER BY er.path, er.row_order, er.is_inherited, er.trustee
+"@
+        $View.ExportParams = $parameters.Clone()
+
         $controls.GrdFolders.ItemsSource = @()
         $controls.BtnExportCsv.IsEnabled = $false
 
@@ -122,7 +175,9 @@ SELECT COALESCE(p.name, a.trustee_sid) AS Trustee,
        a.access_control_type AS AceType,
        a.rights_text AS Rights,
        CASE a.is_inherited WHEN 1 THEN 'Y' ELSE 'N' END AS Inherited,
-       COALESCE(a.inherited_from, '') AS InheritedFrom
+       CASE WHEN LOWER(COALESCE(a.inherited_from, '')) LIKE '%unknown paren%'
+            THEN 'Parent out of scope'
+            ELSE COALESCE(a.inherited_from, '') END AS InheritedFrom
 FROM aces a
 LEFT JOIN principals p ON p.sid = a.trustee_sid
 WHERE a.folder_id = @folder
@@ -192,13 +247,19 @@ $controls.BtnExportCsv.Add_Click({
     $rows = @($view.Controls.GrdFolders.ItemsSource)
     if ($rows.Count -gt 0) {
         $dialog = [System.Windows.Forms.SaveFileDialog]::new()
-        $dialog.Filter   = 'CSV (*.csv)|*.csv'
-        $dialog.FileName = "FolderView_scan$($view.App.CurrentScanId).csv"
-        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $rows | Export-Csv -NoTypeInformation -Path $dialog.FileName -Encoding UTF8
-            $view.App.SetStatus("Exported to $($dialog.FileName)")
+        try {
+            $dialog.Filter   = 'CSV (*.csv)|*.csv'
+            $dialog.FileName = "FolderView_scan$($view.App.CurrentScanId).csv"
+            if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $exportRows = @($view.App.Query($view.ExportSql, $view.ExportParams))
+                $exportRows | Export-Csv -NoTypeInformation -Path $dialog.FileName -Encoding UTF8
+                $view.App.SetStatus("Exported to $($dialog.FileName)")
+            }
+        } catch {
+            $view.App.ShowError('Folder CSV export failed', $_.Exception.Message, $_.Exception.ToString(), 'Folder view export')
+        } finally {
+            $dialog.Dispose()
         }
-        $dialog.Dispose()
     }
 })
 

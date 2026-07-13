@@ -1,220 +1,175 @@
 # ShareACL
 
-ShareACL is a PowerShell GUI tool for mass auditing folder permissions. It also provides built-in functionality for drop-in swapping principals in folder ACLs.
+ShareACL is a Windows PowerShell 7 tool for auditing NTFS permissions at scale. It captures folder ACLs in a portable SQLite database, resolves Active Directory identities and group membership, and provides focused views for investigation and controlled ACL substitutions.
 
-The main use case is simple: point ShareACL at one or more file share roots, let it collect NTFS permissions into a local SQLite database, then use the views to find risky or messy permissions without clicking through every folder by hand.
+**[Quick start](#quick-start)** · **[Features](#features)** · **[Operations guide](#operations-guide)** · **[Safety](#operational-safety)** · **[Stability testing](#stability-testing)**
 
-ShareACL does not replace normal change control. Treat the scan output as audit evidence, and treat ACL Swap as a change tool.
+> ShareACL is an audit and change-support tool. Treat scan results as evidence, verify conclusions against the live filesystem where appropriate, and use normal change control for ACL changes.
+
+![ShareACL Findings view](doc/images/shareacl_findings_example.png "ShareACL Findings view")
 
 ## Features
 
-The following features are currently implemented:
-
-| Feature | Description |
+| Capability | What it helps you do |
 | --- | --- |
-| 📁 Folder view | Per-folder view of all assigned principals and their access levels |
-| 👤 Account view | Per-account view of folders the selected principal has access to |
-| 📋 Findings view | A summary of potential problems in the permission structure |
-| 🔃 ACL Swap | A tool to replace one principal with another in a folder structure |
-| 🔍 Scan functionality | The core of the tool providing information to each of the views listed above |
+| 📁 **Folder view** | Filter and review up to 5,000 matching folders at a time, inspect each folder’s ACEs, identify broken inheritance and explicit permissions, and export the folder and trustee detail to CSV. |
+| 👤 **Account view** | Find folders reachable by a user, group, or computer, show direct versus group-derived access, and optionally verify live effective access. |
+| 📋 **Findings** | Prioritise common permission risks such as orphaned SIDs, broad access, direct user ACEs, Deny ACEs, and scan errors. |
+| 🔎 **Collector and resolver** | Scan one or more roots to SQLite, then resolve SIDs and transitive group membership from Active Directory. Run them from the GUI or independently. |
+| 🔃 **ACL Swap** | Preview, execute, audit, and verify a replacement of one explicit trustee with another. Supports scan-based discovery and a live filesystem walk. |
+| 🧾 **Audit and diagnostics** | Record swap activity in SQLite and JSONL, and inspect bounded session errors from the clickable status-bar indicator. |
 
-The scan collector and resolver can also be run independently without the GUI wrapper.
+### A typical workflow
 
-At a high level:
+1. Scan one or more folder roots into a local SQLite database.
+2. Run the resolver to replace raw SIDs with identities and record group membership.
+3. Start in **Findings** to identify higher-risk patterns.
+4. Use **Folder view** for folder-focused investigation and **Account view** for principal-focused investigation.
+5. Export a focused CSV when a result needs review outside ShareACL.
+6. Use **ACL Swap** only after previewing, approving, and narrowing the required change.
 
-1. The collector walks the selected folder roots and records folders, owners, inheritance state, and ACEs.
-2. The resolver looks up the SIDs from the scan in Active Directory and records names, account types, and group membership.
-3. The GUI reads the database and presents the results.
+## Requirements
 
-![Example Findings](/doc/images/shareacl_findings_example.png "Example Findings")
+Run ShareACL from a Windows device that can reach the relevant file shares and, for identity resolution, Active Directory domain controllers.
 
-## Prerequisites
+| Requirement | Used for |
+| --- | --- |
+| PowerShell 7+ (Tested on 7.6.3) | GUI, collector, and resolver |
+| [PSSQLite](https://www.powershellgallery.com/packages/PSSQLite) | ShareACL database access |
+| [NTFSSecurity](https://www.powershellgallery.com/packages/NTFSSecurity) | Collecting and changing NTFS ACLs |
+| ActiveDirectory module / RSAT | Resolving principals, group memberships, and live AD principal search |
 
-- PowerShell 7+
-- ActiveDirectory module
-- PSSQLite module
-- NTFSSecurity module
-
-Run the tool from a Windows device that can reach the file shares and the domain controllers for the target environment.
-
-The account running the scan needs read access to the folders being scanned. If the account cannot read a folder, ShareACL will keep going and record the error in the scan results.
-
-For ACL Swap, run PowerShell as Administrator where possible. ACL writes still depend on the permissions of the account running the tool.
-
-### Checking prerequisites
-
-Open PowerShell 7 and run:
+Check the environment before first use:
 
 ```powershell
 $PSVersionTable.PSVersion
 Get-Module -ListAvailable ActiveDirectory, PSSQLite, NTFSSecurity
 ```
 
-If a module is missing:
-
-- `ActiveDirectory` is normally installed through RSAT or Windows Server management tools.
-- `PSSQLite` and `NTFSSecurity` can normally be installed from the PowerShell Gallery if your workstation has access to it:
+If permitted in your environment, install PowerShell Gallery modules for the current user:
 
 ```powershell
 Install-Module PSSQLite -Scope CurrentUser
 Install-Module NTFSSecurity -Scope CurrentUser
 ```
 
-## Installation and usage
+The account running a scan needs read access to the folders being audited. Access-denied and path errors do not stop the scan, but they are audit gaps and appear in **Findings** and the scan error records.
 
-### Getting started
+## Quick start
 
-1. Clone the repository (or download and extract a [release](https://github.com/stellarau/shareacl/releases)) to a device with access to your AD and file shares
-2. Run `ShareAcl.GUI\Start-ShareAcl.ps1` (see note below)
-3. On first run, you will need to create a new database
+1. Clone or extract the repository on a workstation with the required access.
+2. Start the isolated GUI launcher:
 
-> **NOTE:** The `Start-ShareAcl.ps1` launcher is used to contain the tool into its own PowerShell process, which prevents excessive handle leakage across multiple runs.
+   ```powershell
+   Set-ExecutionPolicy Bypass -Scope Process
+   .\ShareAcl.GUI\Start-ShareAcl.ps1
+   ```
 
-Simple first run:
+   The launcher starts the GUI in its own PowerShell process, keeping each GUI session isolated from previous runs.
 
-```powershell
-cd "C:\Path\To\NTFS Permissions"
-Set-ExecutionPolicy Bypass -Scope Process;.\ShareAcl.GUI\Start-ShareAcl.ps1
-```
+3. Select **New database…** and save a database, for example `C:\Temp\shareacl.db`.
+4. Select **New scan…**, add one or more UNC or local roots, and start the scan.
+5. Leave **Run resolver after** enabled unless identity resolution is being performed separately.
+6. Choose the completed scan from the **Scan** list, then open **Findings**, **Folder view**, or **Account view**.
 
-> **NOTE:** If your environment allows running unsigned scripts, you can leave out the 'Set-ExecutionPolicy' part.
-
-When the window opens:
-
-1. Click **New database...**
-2. Save the database somewhere sensible, for example `C:\Temp\shareacl.db`
-3. Click **New scan...**
-4. Enter the share root paths you need to scan
-5. Leave **Run resolver after** ticked
-6. Click **Start scan**
-
-You can also open an existing database by using the **Database** box at the top of the window:
-
-1. Click **Browse...**
-2. Select the `.db` file
-3. Click **Open**
-4. Pick a scan from the **Scan** dropdown
-
-### Scanning a folder
-
-1. Click the **New scan...** button to open a Scan dialog
-2. Pick at least one root folder to scan (separate multiple folders with line breaks)
-3. Choose your scan options (default is usually fine)
-4. Click **Start scan**
-5. The collector output will be displayed in the Output box
-6. If you ticked "Run resolver after", the resolver will run directly after the collector. The resolver has no other output aside from a success or failure message.
-
-> **NOTE:** There is currently no GUI option to run the resolver separately. Keep the "Run resolver after" box ticked unless you are comfortable running the resolver manually from the Terminal.
-
-Use UNC paths where possible, for example:
+Use UNC paths where possible:
 
 ```text
 \\fileserver01\Finance
 \\fileserver01\HR
 ```
 
-The scan has two main phases:
+For a first validation, scan one small representative root. After confirming that the workstation, account, modules, and database location work as expected, expand the scope.
 
-- **Counting**: ShareACL counts folders so it can show progress and an estimated finish time.
-- **Running**: ShareACL records folders and ACLs into the database.
+## Operations guide
 
-If a scan fails, check the Output box first. Common causes are missing modules, no access to the share, a disconnected VPN, or a database file that is already locked by another process.
+### Create, open, and select scans
 
-For large shares, start with one share root first. Once you know the tool is working from that workstation and account, scan larger scopes.
+The top bar controls the active database and scan. Opening a database validates the ShareACL tables and applies supported additive migrations. The current scan determines the data available in the reporting views.
 
-### Navigating a completed scan
+New scans report progress in two phases:
 
-Once you have a completed scan loaded, you can navigate the different views from the left navigation bar.
+- **Counting** estimates folder count and completion time.
+- **Running** records folders, ACLs, owners, inheritance state, and scan errors.
+
+Use **Run resolver…** to resolve outstanding principals and group memberships for the current scan or the whole database without running another collection.
+
+Folder, Account, and Findings queries load in the background; ShareACL shows a busy overlay while results are being retrieved.
 
 ### Folder view
 
-Use **Folder view** when you know the folder path and want to see what is directly on it.
+Use **Folder view** to investigate a path or permission structure.
 
-Useful checks:
+1. Enter part of a path and press <kbd>Enter</kbd>, or choose **Refresh**.
+2. Optionally select **Broken inheritance only** or **Explicit ACEs only**.
+3. Select a folder to inspect its trustee, SID, type, rights, inheritance, and source details.
+4. Choose **Export CSV…** to export the current filtered set.
 
-1. Type part of a folder path in the filter box
-2. Press **Enter** or click **Refresh**
-3. Select a folder in the top grid
-4. Review the ACEs in the lower grid
+Folder CSV exports include the trustee/ACE detail needed for review:
 
-Tick **Broken inheritance only** to show folders where inheritance is disabled. Tick **Explicit ACEs only** to show folders with permissions set directly on the folder.
-
-Use **Export CSV** if you need to send the list to another team.
+- Scan roots list their recorded ACEs, including inherited ACEs.
+- Inherited child folders include an **Inherited from parent** row, followed by any explicit ACE rows.
+- Broken-inheritance folders include one row per ACE.
+- Inheritance that originates above the scan root is labelled **Parent out of scope**.
 
 ### Account view
 
-Use **Account view** when someone asks, "What can this user or group access?"
+Use **Account view** to answer “what can this principal reach?”
 
-Basic steps:
+1. Choose **Pick principal…**.
+2. Search the resolved database identities or Active Directory. The search box receives focus automatically; double-click a result to select it.
+3. Filter by path or restrict the result to Allow and/or explicit ACEs.
+4. Review the **Via** column and membership chain to understand direct and group-derived access.
+5. Select a result and use **Live effective access** when a current filesystem check is needed.
 
-1. Click **Pick principal**
-2. Search for the user, group, or computer account
-3. Select the correct result and click **OK**
-4. Use the path filter if you only care about one share or folder
-5. Review the folders listed in the grid
+The resolver is important here: without resolved group membership, Account view cannot show access granted through groups.
 
-The **Via** information shows whether access is direct or through group membership. If the resolver has not been run, this view will be much less useful because group membership will be missing.
+### Findings
 
-The **Live effective access** button asks the filesystem for the selected account's effective access on the selected folder. Use this when the database says access should exist but you need to confirm what Windows currently reports.
-
-### Findings view
-
-Use **Findings** as the first pass for cleanup work. It groups common permission problems into a small number of lists.
-
-Current findings include:
+Use **Findings** as a first-pass permission review. It groups and prioritises patterns including:
 
 - Orphaned SIDs on ACEs
 - Everyone exposure
 - Non-admin Full Control
-- Admin principal with explicit Full Control
+- Explicit Full Control for administrative principals
 - Unreachable folders
 - Broad principal exposure
 - Direct user ACEs
 - Deny ACEs
 - Scan errors
 
-Select a finding on the left to load the matching folders on the right. Use **Export CSV** when the result needs to be reviewed outside the tool.
+Select a catalogue item to load its matching rows. Depending on the finding, you can open a selected path in Folder view, copy its path, export the rows, or pre-fill ACL Swap with a selected trustee and scope.
 
-For findings that support it, **Swap principal** will pre-fill the ACL Swap page with the selected source principal and folder scope.
+### Recent errors
 
-### Swapping ACLs
+When a GUI operation reports an error, **Recent errors (n)** appears in the status bar. Select it to review the session log, including timestamps, source, summary, and technical details. Entries can be copied or cleared; the in-memory log is capped at 500 entries and 32 KiB of detail per entry.
 
-The ACL Swap functionality can be used with or without an existing folder scan. A database is required to record each swap. A fuller audit view for previous swaps is planned in a future release. If no scan is loaded, principals can only be picked directly from AD, and target folders have to be walked live. This may have significant performance implications on larger shares.
+### ACL Swap
 
-When a scan is loaded, you can pre-fill the source principal and target folder directly from certain findings in the Findings view.
+ACL Swap replaces explicit ACEs for one principal with equivalent ACEs for another principal. A database is always required so the operation can be recorded, even when discovery uses the live filesystem.
 
-Use ACL Swap when you need to replace one principal with another while keeping the same rights. For example, replacing a direct user ACE with a new AD group ACE.
-
-Basic steps:
-
-1. Open a database
-2. Select a scan if you want to use scan-based discovery
-3. Click **ACL Swap**
-4. Pick the **Source** principal to replace
-5. Pick the **Target** principal to add
-6. Pick the **Scope** folder
-7. Leave **Scan** mode selected if you have a current scan, or use **Live walk** if you do not
-8. Click **Preview**
-9. Review the affected folders
-10. Type `APPLY` in the confirmation box
-11. Click **Execute**
-12. Click **Verify** after the run completes
-
-Important safety notes:
-
-- Do not run ACL Swap against a whole drive root or whole share root unless you have a clear change request.
-- Preview first, every time.
-- If the preview result is larger than expected, stop and narrow the scope.
-- The tool refuses some dangerous well-known SID swaps unless an override is selected.
-- The target principal must not be a broad built-in identity like Everyone or Authenticated Users.
+1. Open **ACL Swap** and choose a source principal, target principal, and scope.
+2. Use **Scan** mode when a suitable scan is loaded; use **Live walk** only when needed.
+3. Choose **Preview** and inspect the affected folders and rights.
+4. Type `APPLY`, then choose **Execute**.
+5. Choose **Verify** to check the live ACL state.
 
 Swap activity is written to the database and to `ShareAcl.GUI\Logs\swap-audit.jsonl`.
 
-## Running without the GUI
+## Operational safety
 
-The collector and resolver can be run from PowerShell 7 without opening the GUI.
+- Run ACL Swap as an administrator where possible. Successful writes still depend on the caller’s rights to the target folders.
+- Do not use ACL Swap against a drive root or share root without a clear, approved change request.
+- Preview every change. If the preview is broader than expected, stop and narrow the scope.
+- The tool blocks selected dangerous well-known SID substitutions unless an override is explicitly selected, and it will not use broad identities such as Everyone or Authenticated Users as a target.
+- A completed scan is historical evidence. Use **Live effective access** or **Verify** when you need to validate the filesystem’s current state.
+- Keep the database in a location that can be backed up and is not being written by another process.
 
-Collector example:
+## Command-line use
+
+The collector and resolver can run without the GUI.
+
+Collect one or more roots:
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
@@ -222,14 +177,14 @@ pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
   -Database "C:\Temp\shareacl.db"
 ```
 
-Resolver example:
+Resolve outstanding principals and group memberships:
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-ShareAclResolver.ps1 `
   -Database "C:\Temp\shareacl.db"
 ```
 
-Resume the most recent running scan in a database:
+Resume the most recent running scan:
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
@@ -238,7 +193,7 @@ pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
   -Resume
 ```
 
-Limit scan depth while testing:
+Limit depth for a smaller test scan:
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
@@ -251,30 +206,34 @@ pwsh -NoProfile -File .\Invoke-ShareAclCollector.ps1 `
 
 ### The GUI does not start
 
-Check that you are using PowerShell 7, not Windows PowerShell 5.1:
+Confirm that `pwsh` is PowerShell 7, then check that PSSQLite is available:
 
 ```powershell
-pwsh -NoProfile -File .\ShareAcl.GUI\Start-ShareAcl.ps1
+pwsh -NoProfile -Command '$PSVersionTable.PSVersion; Get-Module -ListAvailable PSSQLite'
 ```
 
-If it still fails, check the error text for a missing module name.
+Run the launcher from a PowerShell 7 terminal and check the displayed error for a missing module or assembly.
 
-### The scan shows access denied errors
+If you are having unexplained issues with your version of PowerShell 7, please update to the latest before reporting an issue.
 
-This usually means the account running the scan cannot read one or more folders. The scan can still be useful, but those folders are audit gaps. Re-run with an account that has enough access if the missing folders matter.
+### The scan reports access-denied errors
 
-### The findings show SIDs instead of names
+The account could not read one or more folders. The rest of the scan can still be useful, but the inaccessible paths are audit gaps. Use an account with sufficient read access if those paths must be included.
 
-Run the resolver. In the GUI, keep **Run resolver after** ticked when starting a scan. From the terminal, run `Invoke-ShareAclResolver.ps1` against the database.
+### Findings show SIDs instead of names
+
+Run the resolver from **Run resolver…** or execute `Invoke-ShareAclResolver.ps1` against the database.
 
 ### Account view does not show expected group access
 
-Run the resolver and make sure the workstation can query Active Directory. Group membership is recorded by the resolver, not by the collector.
+Run the resolver and confirm the workstation can query Active Directory. Group membership comes from the resolver, not the collector.
 
 ### ACL Swap preview is slow
 
-Use scan mode where possible. Live walk reads the filesystem directly and can be slow on large folder trees.
+Prefer **Scan** mode. **Live walk** reads the filesystem directly and can be slow on large trees.
 
----
+## Project status
 
-This tool is in active development. When in doubt, ask Jono.
+ShareACL v1.0-RC1 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/stellarau/shareacl/issues) for planned work.
+
+The tool comes with no support and is distributed AS-IS. No liability for damage caused by using or misusing the tool is accepted by Stellar Systems or any of the contributors.
