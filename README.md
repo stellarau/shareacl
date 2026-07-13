@@ -2,7 +2,7 @@
 
 ShareACL is a Windows PowerShell 7 tool for auditing NTFS permissions at scale. It captures folder ACLs in a portable SQLite database, resolves Active Directory identities and group membership, and provides focused views for investigation and controlled ACL substitutions.
 
-**[Quick start](#quick-start)** · **[Features](#features)** · **[Operations guide](#operations-guide)** · **[Safety](#operational-safety)** · **[Stability testing](#stability-testing)**
+**[Quick start](#quick-start)** · **[Features](#features)** · **[Operations guide](#operations-guide)** · **[Safety](#operational-safety)**
 
 > ShareACL is an audit and change-support tool. Treat scan results as evidence, verify conclusions against the live filesystem where appropriate, and use normal change control for ACL changes.
 
@@ -237,3 +237,7 @@ Prefer **Scan** mode. **Live walk** reads the filesystem directly and can be slo
 ShareACL v1.0-RC1 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/stellarau/shareacl/issues) for planned work.
 
 The tool comes with no support and is distributed AS-IS. No liability for damage caused by using or misusing the tool is accepted by Stellar Systems or any of the contributors.
+
+## License
+
+Copyright 2026 Stellar Systems Pty Ltd. Licensed under the [Apache License, Version 2.0](LICENSE).
