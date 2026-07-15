@@ -34,7 +34,24 @@
                           IsChecked="True" VerticalAlignment="Center"/>
             </StackPanel>
 
-            <TextBlock x:Name="TxtStatus" Foreground="#666" Margin="0,10,0,4" Text="Ready."/>
+            <TextBlock x:Name="TxtStatus" Foreground="#666" Margin="0,10,0,4" Text="Ready."
+                       TextWrapping="Wrap"/>
+            <Border x:Name="BorderProgress" BorderBrush="#DDD" BorderThickness="1"
+                    Padding="10" Margin="0,4,0,8" Visibility="Collapsed">
+                <StackPanel>
+                    <ProgressBar x:Name="PbProgress" Height="18" Minimum="0" Maximum="100" Value="0"/>
+                    <Grid Margin="0,6,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="TxtProgressLeft" Grid.Column="0" Foreground="#333"
+                                   TextTrimming="CharacterEllipsis"/>
+                        <TextBlock x:Name="TxtProgressRight" Grid.Column="1" Foreground="#555"
+                                   FontFamily="Consolas" Margin="12,0,0,0"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
         </StackPanel>
 
         <GroupBox Header="Output">

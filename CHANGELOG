@@ -1,3 +1,12 @@
+== ShareAcl v1.0-RC2 - 2026-07-15 ==
+
+New features:
+- Added live resolver phase/count progress, elapsed time, child-process status, and stalled-activity warnings to both GUI resolver workflows.
+
+Improvements:
+- Centralised the application version in the repository-level VERSION file and automatically displayed it in the main window title.
+- Moved ACL Swap live-walk discovery to a background runspace with responsive, coalesced progress updates.
+
 == ShareAcl v1.0-RC1 - 2026-07-13 ==
 
 New features:

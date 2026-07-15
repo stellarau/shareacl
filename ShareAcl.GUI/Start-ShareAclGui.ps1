@@ -62,18 +62,94 @@ try { [System.Data.SQLite.SQLiteConnection]::ClearAllPools() } catch { }
 [System.GC]::Collect()
 
 # -----------------------------------------------------------------------------
-# Shared constants (defined once to dodge the [Type]::Member rendering trap)
+# Shared constants
 # -----------------------------------------------------------------------------
 $Script:DbNull          = [System.DBNull]::Value
 $Script:ScriptRoot      = $PSScriptRoot
 $Script:PagesRoot       = Join-Path $PSScriptRoot 'Pages'
+$Script:VersionPath     = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
 
 function Get-NowUtc { [System.DateTime]::UtcNow.ToString('o') }
+
+function Get-ShareAclVersion {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $fallback = '0.0-dev'
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Warning "Version file not found: $Path. Using $fallback."
+        return $fallback
+    }
+
+    try {
+        $version = [string](Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction Stop)
+        $version = $version.Trim()
+    } catch {
+        Write-Warning "Version file could not be read: $($_.Exception.Message). Using $fallback."
+        return $fallback
+    }
+
+    # Accept two- or three-component release versions plus SemVer-style
+    # prerelease/build labels, including the project's established 1.0-RC1 form.
+    if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        Write-Warning "Version file contains an invalid version '$version'. Using $fallback."
+        return $fallback
+    }
+
+    $version
+}
+
+$Script:AppVersion = Get-ShareAclVersion -Path $Script:VersionPath
+
+function ConvertFrom-ResolverProgressLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line) -or
+        -not $Line.StartsWith('SHAREACL_RESOLVER_PROGRESS|', [System.StringComparison]::Ordinal)) {
+        return $null
+    }
+
+    $parts = $Line -split '\|', 5
+    $current = 0
+    $total = 0
+    if ($parts.Count -ne 5 -or
+        -not [int]::TryParse($parts[2], [ref]$current) -or
+        -not [int]::TryParse($parts[3], [ref]$total)) {
+        return $null
+    }
+
+    [pscustomobject]@{
+        Phase    = $parts[1]
+        Current  = $current
+        Total    = $total
+        Activity = $parts[4]
+    }
+}
+
+function Format-ElapsedClock {
+    param([TimeSpan]$Duration)
+
+    if ($Duration.TotalSeconds -lt 0) { $Duration = [TimeSpan]::Zero }
+    '{0:00}:{1:00}:{2:00}' -f [Math]::Floor($Duration.TotalHours), $Duration.Minutes, $Duration.Seconds
+}
+
+function Format-ActivityAge {
+    param([TimeSpan]$Duration)
+
+    if ($Duration.TotalSeconds -lt 60) {
+        return ('{0:N0}s' -f [Math]::Max(0, [Math]::Floor($Duration.TotalSeconds)))
+    }
+    if ($Duration.TotalMinutes -lt 60) {
+        return ('{0:N0}m {1:N0}s' -f [Math]::Floor($Duration.TotalMinutes), $Duration.Seconds)
+    }
+    '{0:N0}h {1:N0}m' -f [Math]::Floor($Duration.TotalHours), $Duration.Minutes
+}
 
 # -----------------------------------------------------------------------------
 # Application state — one bag, passed to every page
 # -----------------------------------------------------------------------------
 $Script:App = [pscustomobject]@{
+    Version         = $Script:AppVersion
+    WindowTitle     = "ShareACL v$Script:AppVersion"
     DbPath          = $null
     Connection      = $null
     CurrentScanId   = $null
@@ -297,6 +373,7 @@ function Close-AppAsyncResources {
         $Operation.Runspace = $null
     }
     $Operation.Handle = $null
+    $Operation.ProgressQueue = $null
 }
 
 function Complete-AppAsyncOperation {
@@ -360,6 +437,7 @@ function Complete-AppAsyncOperation {
                 $App.ShowError($Operation.ErrorTitle, [string]$wrapped.Error, [string]$wrapped.Details, $Operation.Name)
             }
         }
+        $Operation.OnProgress = $null
         $Operation.OnComplete = $null
         $Operation.Owner = $null
     }
@@ -384,6 +462,7 @@ function Stop-AppOperationInstance {
             Close-AppAsyncResources -Operation $Operation
             Remove-AppOperationReference -App $App -Operation $Operation
             Hide-AppBusy -App $App -OperationId $Operation.Id
+            $Operation.OnProgress = $null
             $Operation.OnComplete = $null
             $Operation.Owner = $null
         } elseif (-not $Operation.CancelRequested) {
@@ -442,7 +521,8 @@ function Start-AppAsyncOperation {
         [hashtable]$Context,
         [scriptblock]$Work,
         [scriptblock]$OnComplete,
-        [string]$ErrorTitle = 'Background operation failed'
+        [string]$ErrorTitle = 'Background operation failed',
+        [scriptblock]$OnProgress = $null
     )
 
     $operation = $null
@@ -461,6 +541,14 @@ function Start-AppAsyncOperation {
             foreach ($key in $Context.Keys) { $workerContext[$key] = $Context[$key] }
         }
         $workerContext.DbPath = $App.DbPath
+        $progressQueue = if ($null -ne $OnProgress) {
+            [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+        } else {
+            $null
+        }
+        if ($null -ne $progressQueue) {
+            $workerContext.ProgressQueue = $progressQueue
+        }
 
         $operation = [pscustomobject]@{
             Id              = [guid]::NewGuid().ToString('N')
@@ -472,6 +560,8 @@ function Start-AppAsyncOperation {
             Timer           = $null
             TimerHandler    = $null
             OnComplete      = $OnComplete
+            OnProgress      = $OnProgress
+            ProgressQueue   = $progressQueue
             ErrorTitle      = $ErrorTitle
             CancelRequested = $false
             Completed       = $false
@@ -496,10 +586,13 @@ function Start-AppAsyncOperation {
         # Pass its text and compile a new ScriptBlock in the worker runspace.
         $workerText = $Work.ToString()
         $wrapperText = @'
-param($Ctx, $WorkerText)
+param($Ctx, $WorkerText, $ProgressQueue)
 
 $ErrorActionPreference = 'Stop'
 try {
+    if ($null -ne $ProgressQueue) {
+        $Ctx['ProgressQueue'] = $ProgressQueue
+    }
     $worker = [scriptblock]::Create($WorkerText)
     $results = @(& $worker $Ctx)
     $result = if ($results.Count -eq 0) {
@@ -525,6 +618,7 @@ try {
         [void]$powershell.AddScript($wrapperText)
         [void]$powershell.AddArgument($workerContext)
         [void]$powershell.AddArgument($workerText)
+        [void]$powershell.AddArgument($progressQueue)
 
         $operation.PowerShell = $powershell
         $operation.Runspace   = $runspace
@@ -541,6 +635,41 @@ try {
         $removeReferenceCommand = $App.Commands.RemoveAsyncReference
         $hideBusyCommand = $App.Commands.HideBusy
         $timerHandlerScript = {
+            if ($null -ne $operationReference.ProgressQueue -and
+                $null -ne $operationReference.OnProgress -and
+                -not $operationReference.CancelRequested) {
+                $progressItem = $null
+                $latestProgress = $null
+                while ($operationReference.ProgressQueue.TryDequeue([ref]$progressItem)) {
+                    $latestProgress = $progressItem
+                    $progressItem = $null
+                }
+                if ($null -ne $latestProgress) {
+                    $owner = $operationReference.Owner
+                    $canPublish = $null -ne $owner -and
+                                  $owner.IsActive -and
+                                  $null -ne $appReference.CurrentPage -and
+                                  ($appReference.CurrentPage.Id -eq $owner.Id) -and
+                                  (-not $appReference.IsClosing)
+                    if ($canPublish) {
+                        try {
+                            & $operationReference.OnProgress $latestProgress $owner
+                        } catch {
+                            # Stop publishing progress after the first UI callback
+                            # failure. Completion and cleanup must still proceed.
+                            $operationReference.OnProgress = $null
+                            try {
+                                $appReference.ShowError(
+                                    'Background progress update failed',
+                                    $_.Exception.Message,
+                                    $_.Exception.ToString(),
+                                    [string]$operationReference.Name
+                                )
+                            } catch { }
+                        }
+                    }
+                }
+            }
             if ($null -ne $operationReference.Handle -and $operationReference.Handle.IsCompleted) {
                 try {
                     & $completionCommand -App $appReference -Operation $operationReference
@@ -553,6 +682,7 @@ try {
                     try { & $removeReferenceCommand -App $appReference -Operation $operationReference } catch { }
                     try { & $hideBusyCommand -App $appReference -OperationId ([string]$operationReference.Id) } catch { }
                     $operationReference.OnComplete = $null
+                    $operationReference.OnProgress = $null
                     $operationReference.Owner = $null
                     try {
                         $appReference.ShowError(
@@ -575,6 +705,9 @@ try {
             Close-AppAsyncResources -Operation $operation
             Remove-AppOperationReference -App $App -Operation $operation
             Hide-AppBusy -App $App -OperationId $operation.Id
+            $operation.OnProgress = $null
+            $operation.OnComplete = $null
+            $operation.Owner = $null
         }
         $App.ShowError('Unable to start background operation', $_.Exception.Message, $_.Exception.ToString(), $Name)
         $operation = $null
@@ -591,13 +724,14 @@ $Script:App | Add-Member -MemberType ScriptMethod -Name StartAsync -Value {
         [hashtable]$Context,
         [scriptblock]$Work,
         [scriptblock]$OnComplete,
-        [string]$ErrorTitle = 'Background operation failed'
+        [string]$ErrorTitle = 'Background operation failed',
+        [scriptblock]$OnProgress = $null
     )
 
     $command = $this.Commands.StartAsync
     & $command -App $this -PageContext $PageContext -Name $Name `
         -BusyText $BusyText -Context $Context -Work $Work `
-        -OnComplete $OnComplete -ErrorTitle $ErrorTitle
+        -OnComplete $OnComplete -ErrorTitle $ErrorTitle -OnProgress $OnProgress
 }
 
 $Script:App | Add-Member -MemberType ScriptMethod -Name CancelAsync -Value {
@@ -1198,6 +1332,10 @@ function Show-RunResolverDialog {
     $btnClose      = $win.FindName('BtnClose')
     $txtOutput     = $win.FindName('TxtOutput')
     $txtStatus     = $win.FindName('TxtStatus')
+    $borderProgress = $win.FindName('BorderProgress')
+    $pbProgress     = $win.FindName('PbProgress')
+    $txtProgressLeft  = $win.FindName('TxtProgressLeft')
+    $txtProgressRight = $win.FindName('TxtProgressRight')
 
     $resolverPath = [System.IO.Path]::GetFullPath((Join-Path $Script:ScriptRoot '..\Invoke-ShareAclResolver.ps1'))
     if (-not (Test-Path $resolverPath)) {
@@ -1218,6 +1356,10 @@ function Show-RunResolverDialog {
         Phase      = 'idle'
         StdoutReg  = $null
         StderrReg  = $null
+        StartedUtc = $null
+        LastProgressUtc = $null
+        ProgressActivity = 'Starting resolver…'
+        TickCount  = 0
     }
 
     $cleanupResolverProcess = {
@@ -1234,10 +1376,13 @@ function Show-RunResolverDialog {
 
         $process = $dlgState.Proc
         if ($null -ne $process) {
-            if ($Terminate -and -not $process.HasExited) {
+            $hasExited = $true
+            try { $hasExited = $process.HasExited } catch { }
+            if ($Terminate -and -not $hasExited) {
                 try { $process.Kill() } catch { }
             }
-            if (-not $process.HasExited) {
+            try { $hasExited = $process.HasExited } catch { $hasExited = $true }
+            if (-not $hasExited) {
                 try { [void]$process.WaitForExit(2000) } catch { }
             }
             try { $process.CancelOutputRead() } catch { }
@@ -1247,9 +1392,33 @@ function Show-RunResolverDialog {
         }
     }.GetNewClosure()
 
+    $applyResolverProgress = {
+        param($Progress)
+
+        $now = [DateTime]::UtcNow
+        $dlgState.LastProgressUtc = $now
+        $dlgState.ProgressActivity = $Progress.Activity
+
+        $borderProgress.Visibility = [System.Windows.Visibility]::Visible
+        if ($Progress.Total -gt 0) {
+            $pbProgress.IsIndeterminate = $false
+            $pbProgress.Value = [Math]::Min(100, ($Progress.Current / $Progress.Total) * 100)
+            $txtProgressRight.Text = '{0:N0} / {1:N0}' -f $Progress.Current, $Progress.Total
+        } else {
+            $pbProgress.IsIndeterminate = $true
+            $txtProgressRight.Text = ''
+        }
+        $txtProgressLeft.Text = $Progress.Activity
+    }.GetNewClosure()
+
     $drainQueue = {
         $line = $null
         while ($outputQueue.TryDequeue([ref]$line)) {
+            $progress = ConvertFrom-ResolverProgressLine -Line $line
+            if ($null -ne $progress) {
+                & $applyResolverProgress $progress
+                continue
+            }
             $txtOutput.AppendText($line + "`r`n")
         }
         $txtOutput.ScrollToEnd()
@@ -1265,6 +1434,38 @@ function Show-RunResolverDialog {
     $setStatus = {
         param([string]$Text)
         $txtStatus.Text = $Text
+    }.GetNewClosure()
+
+    $updateResolverMonitor = {
+        if ($dlgState.Phase -ne 'running' -or $null -eq $dlgState.StartedUtc) { return }
+
+        $now = [DateTime]::UtcNow
+        $elapsed = $now - $dlgState.StartedUtc
+        $lastProgress = if ($null -ne $dlgState.LastProgressUtc) {
+            $dlgState.LastProgressUtc
+        } else {
+            $dlgState.StartedUtc
+        }
+        $quiet = $now - $lastProgress
+        $elapsedText = Format-ElapsedClock -Duration $elapsed
+        $quietText = Format-ActivityAge -Duration $quiet
+        $pidText = if ($null -ne $dlgState.Proc) {
+            try { "PID $($dlgState.Proc.Id)" } catch { 'child process' }
+        } else { 'child process' }
+
+        if ($quiet.TotalSeconds -ge 180) {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            $txtStatus.Text = ("{0} · elapsed {1} · no progress for {2}. Resolver {3} is still running but may be stalled." -f
+                $dlgState.ProgressActivity, $elapsedText, $quietText, $pidText)
+        } elseif ($quiet.TotalSeconds -ge 45) {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            $txtStatus.Text = ("{0} · elapsed {1} · no progress for {2}. Resolver {3} is still running and may be waiting on AD or the database." -f
+                $dlgState.ProgressActivity, $elapsedText, $quietText, $pidText)
+        } else {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
+            $txtStatus.Text = ("{0} · elapsed {1} · last progress {2} ago · {3} running" -f
+                $dlgState.ProgressActivity, $elapsedText, $quietText, $pidText)
+        }
     }.GetNewClosure()
 
     $setRunningUi = {
@@ -1297,12 +1498,15 @@ function Show-RunResolverDialog {
         $cancelled = ($dlgState.Phase -eq 'cancelled')
         if ($cancelled) {
             $dlgState.Phase = 'done'
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
             & $setStatus 'Cancelled.'
             & $setRunningUi $false
             return
         }
         if ($ExitCode -ne 0) {
             $dlgState.Phase = 'done'
+            $pbProgress.IsIndeterminate = $false
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
             & $setStatus "Resolver failed (exit $ExitCode). See output above."
             & $setRunningUi $false
             return
@@ -1312,6 +1516,9 @@ function Show-RunResolverDialog {
             & $checkpointDb
         }
         $dlgState.Phase = 'done'
+        $pbProgress.IsIndeterminate = $false
+        $pbProgress.Value = 100
+        $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkGreen
         & $setStatus 'Complete.'
         try { & $refreshScans } catch { }
         & $setRunningUi $false
@@ -1321,7 +1528,26 @@ function Show-RunResolverDialog {
     $timer.Interval = [System.TimeSpan]::FromMilliseconds(100)
     $resolverTimerTickScript = {
         & $drainQueue
-        if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
+
+        $dlgState.TickCount++
+        if (($dlgState.TickCount % 10) -eq 0) { & $updateResolverMonitor }
+
+        $hasExited = $false
+        if ($dlgState.Proc) {
+            try {
+                $dlgState.Proc.Refresh()
+                $hasExited = $dlgState.Proc.HasExited
+            } catch {
+                $timer.Stop()
+                $dlgState.Phase = 'done'
+                $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
+                & $setStatus "Resolver monitoring failed: $($_.Exception.Message)"
+                & $cleanupResolverProcess $true
+                & $setRunningUi $false
+                return
+            }
+        }
+        if ($hasExited) {
             $timer.Stop()
             $exitCode = $dlgState.Proc.ExitCode
             Start-Sleep -Milliseconds 100
@@ -1335,7 +1561,17 @@ function Show-RunResolverDialog {
 
     $btnStart.Add_Click({
         $dlgState.Phase = 'running'
+        $dlgState.StartedUtc = [DateTime]::UtcNow
+        $dlgState.LastProgressUtc = $dlgState.StartedUtc
+        $dlgState.ProgressActivity = 'Starting resolver…'
+        $dlgState.TickCount = 0
         $txtOutput.Clear()
+        $borderProgress.Visibility = [System.Windows.Visibility]::Visible
+        $pbProgress.IsIndeterminate = $true
+        $pbProgress.Value = 0
+        $txtProgressLeft.Text = 'Starting resolver…'
+        $txtProgressRight.Text = ''
+        $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
         & $setRunningUi $true
         & $setStatus 'Running resolver…'
         & $appendLine '===== RESOLVER STARTED ====='
@@ -1350,7 +1586,7 @@ function Show-RunResolverDialog {
         $lines = @()
         $lines += '$ErrorActionPreference = ''Continue'''
         $lines += 'try {'
-        $lines += "    & '$resolverEsc' -Database '$dbEsc'$scanArg"
+        $lines += "    & '$resolverEsc' -Database '$dbEsc'$scanArg -EmitProgress"
         $lines += '    $rc = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }'
         $lines += '} catch {'
         $lines += '    Write-Host "Resolver threw: $($_.Exception.Message)"'
@@ -1403,9 +1639,19 @@ function Show-RunResolverDialog {
             }
         $dlgState.StderrReg = $stderrReg
 
-        [void]$proc.Start()
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
+        try {
+            [void]$proc.Start()
+            $proc.BeginOutputReadLine()
+            $proc.BeginErrorReadLine()
+        } catch {
+            $dlgState.Phase = 'done'
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
+            & $appendLine "Resolver could not start: $($_.Exception.Message)"
+            & $setStatus 'Resolver could not start. See output above.'
+            & $cleanupResolverProcess $false
+            & $setRunningUi $false
+            return
+        }
 
         $timer.Start()
     }.GetNewClosure())
@@ -1490,6 +1736,9 @@ function Show-NewScanDialog {
         StdoutReg     = $null       # event jobs for cleanup
         StderrReg     = $null
         TickCount     = 0           # for throttling UI updates
+        ResolverStartedUtc = $null
+        ResolverLastProgressUtc = $null
+        ResolverActivity = $null
     }
 
     $cleanupScanProcess = {
@@ -1506,10 +1755,13 @@ function Show-NewScanDialog {
 
         $process = $dlgState.Proc
         if ($null -ne $process) {
-            if ($Terminate -and -not $process.HasExited) {
+            $hasExited = $true
+            try { $hasExited = $process.HasExited } catch { }
+            if ($Terminate -and -not $hasExited) {
                 try { $process.Kill() } catch { }
             }
-            if (-not $process.HasExited) {
+            try { $hasExited = $process.HasExited } catch { $hasExited = $true }
+            if (-not $hasExited) {
                 try { [void]$process.WaitForExit(2000) } catch { }
             }
             try { $process.CancelOutputRead() } catch { }
@@ -1521,15 +1773,45 @@ function Show-NewScanDialog {
 
     # --- UI-thread helpers (no dispatcher marshalling needed) ---
 
+    $applyResolverProgress = {
+        param($Progress)
+
+        $now = [DateTime]::UtcNow
+        if ($dlgState.Phase -ne 'resolving') {
+            $dlgState.Phase = 'resolving'
+            $dlgState.ResolverStartedUtc = $now
+        }
+        $dlgState.ResolverLastProgressUtc = $now
+        $dlgState.ResolverActivity = $Progress.Activity
+
+        $borderProgress.Visibility = [System.Windows.Visibility]::Visible
+        if ($Progress.Total -gt 0) {
+            $pbProgress.IsIndeterminate = $false
+            $pbProgress.Value = [Math]::Min(100, ($Progress.Current / $Progress.Total) * 100)
+            $txtProgressRight.Text = '{0:N0} / {1:N0}' -f $Progress.Current, $Progress.Total
+        } else {
+            $pbProgress.IsIndeterminate = $true
+            $txtProgressRight.Text = ''
+        }
+        $txtProgressLeft.Text = $Progress.Activity
+    }.GetNewClosure()
+
     $drainQueue = {
         $line = $null
         while ($outputQueue.TryDequeue([ref]$line)) {
+            $progress = ConvertFrom-ResolverProgressLine -Line $line
+            if ($null -ne $progress) {
+                & $applyResolverProgress $progress
+                continue
+            }
             $txtOutput.AppendText($line + "`r`n")
         }
         $txtOutput.ScrollToEnd()
     }.GetNewClosure()
 
     $pollProgress = {
+        if ($dlgState.Phase -eq 'resolving') { return }
+
         try {
             $row = Invoke-SqliteQuery -DataSource $app.DbPath -Query @"
                 SELECT scan_id, status, total_folders, processed_folders,
@@ -1605,6 +1887,38 @@ function Show-NewScanDialog {
         $txtStatus.Text = $Text
     }.GetNewClosure()
 
+    $updateResolverMonitor = {
+        if ($dlgState.Phase -ne 'resolving' -or $null -eq $dlgState.ResolverStartedUtc) { return }
+
+        $now = [DateTime]::UtcNow
+        $elapsed = $now - $dlgState.ResolverStartedUtc
+        $lastProgress = if ($null -ne $dlgState.ResolverLastProgressUtc) {
+            $dlgState.ResolverLastProgressUtc
+        } else {
+            $dlgState.ResolverStartedUtc
+        }
+        $quiet = $now - $lastProgress
+        $elapsedText = Format-ElapsedClock -Duration $elapsed
+        $quietText = Format-ActivityAge -Duration $quiet
+        $pidText = if ($null -ne $dlgState.Proc) {
+            try { "PID $($dlgState.Proc.Id)" } catch { 'child process' }
+        } else { 'child process' }
+
+        if ($quiet.TotalSeconds -ge 180) {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            $txtStatus.Text = ("Resolver: {0} · elapsed {1} · no progress for {2}. {3} is still running but may be stalled." -f
+                $dlgState.ResolverActivity, $elapsedText, $quietText, $pidText)
+        } elseif ($quiet.TotalSeconds -ge 45) {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            $txtStatus.Text = ("Resolver: {0} · elapsed {1} · no progress for {2}. {3} is still running and may be waiting on AD or the database." -f
+                $dlgState.ResolverActivity, $elapsedText, $quietText, $pidText)
+        } else {
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
+            $txtStatus.Text = ("Resolver: {0} · elapsed {1} · last progress {2} ago · {3} running" -f
+                $dlgState.ResolverActivity, $elapsedText, $quietText, $pidText)
+        }
+    }.GetNewClosure()
+
     $setRunningUi = {
         param([bool]$Running)
         $btnStart.IsEnabled      = -not $Running
@@ -1638,6 +1952,7 @@ function Show-NewScanDialog {
         $cancelled = ($dlgState.Phase -eq 'cancelled')
         if ($cancelled) {
             $dlgState.Phase = 'done'
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
             & $setStatus 'Cancelled. Partial scan can be resumed via -Resume in a manual run.'
             & $refreshScans
             & $setRunningUi $false
@@ -1645,6 +1960,8 @@ function Show-NewScanDialog {
         }
         if ($ExitCode -ne 0) {
             $dlgState.Phase = 'done'
+            $pbProgress.IsIndeterminate = $false
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
             & $setStatus "Scan pipeline failed (exit $ExitCode). See output above."
             & $refreshScans
             & $setRunningUi $false
@@ -1655,6 +1972,9 @@ function Show-NewScanDialog {
             & $checkpointDb
         }
         $dlgState.Phase = 'done'
+        $pbProgress.IsIndeterminate = $false
+        $pbProgress.Value = 100
+        $txtStatus.Foreground = [System.Windows.Media.Brushes]::DarkGreen
         & $setStatus 'Complete.'
         & $refreshScans
         & $setRunningUi $false
@@ -1667,9 +1987,30 @@ function Show-NewScanDialog {
         & $drainQueue
     
         $dlgState.TickCount++
-        if (($dlgState.TickCount % 10) -eq 0) { & $pollProgress }
+        if (($dlgState.TickCount % 10) -eq 0) {
+            if ($dlgState.Phase -eq 'resolving') {
+                & $updateResolverMonitor
+            } else {
+                & $pollProgress
+            }
+        }
 
-        if ($dlgState.Proc -and $dlgState.Proc.HasExited) {
+        $hasExited = $false
+        if ($dlgState.Proc) {
+            try {
+                $dlgState.Proc.Refresh()
+                $hasExited = $dlgState.Proc.HasExited
+            } catch {
+                $timer.Stop()
+                $dlgState.Phase = 'done'
+                $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
+                & $setStatus "Scan pipeline monitoring failed: $($_.Exception.Message)"
+                & $cleanupScanProcess $true
+                & $setRunningUi $false
+                return
+            }
+        }
+        if ($hasExited) {
             $timer.Stop()
 
             $exitCode = $dlgState.Proc.ExitCode
@@ -1717,6 +2058,9 @@ function Show-NewScanDialog {
 
         $runResolver = [bool]$chkResolver.IsChecked
         $dlgState.Phase = 'collecting'
+        $dlgState.ResolverStartedUtc = $null
+        $dlgState.ResolverLastProgressUtc = $null
+        $dlgState.ResolverActivity = $null
 
         $borderProgress.Visibility = [System.Windows.Visibility]::Collapsed
         $pbProgress.Value = 0
@@ -1724,6 +2068,7 @@ function Show-NewScanDialog {
         $txtProgressLeft.Text  = ''
         $txtProgressRight.Text = ''
         $dlgState.TickCount = 0
+        $txtStatus.Foreground = [System.Windows.Media.Brushes]::DimGray
 
         $txtOutput.Clear()
         & $setRunningUi $true
@@ -1756,7 +2101,7 @@ function Show-NewScanDialog {
             $lines += "    Write-Host ''"
             $lines += "    Write-Host '===== RESOLVER STARTED ====='"
             $lines += '    try {'
-            $lines += "        & '$resolverEsc' -Database '$dbEsc'"
+            $lines += "        & '$resolverEsc' -Database '$dbEsc' -EmitProgress"
             $lines += '        $resolverExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }'
             $lines += '    } catch {'
             $lines += '        Write-Host "Resolver threw: $($_.Exception.Message)"'
@@ -1815,9 +2160,19 @@ function Show-NewScanDialog {
             }
         $dlgState.StderrReg = $stderrReg
 
-        [void]$proc.Start()
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
+        try {
+            [void]$proc.Start()
+            $proc.BeginOutputReadLine()
+            $proc.BeginErrorReadLine()
+        } catch {
+            $dlgState.Phase = 'done'
+            $txtStatus.Foreground = [System.Windows.Media.Brushes]::Firebrick
+            & $appendLine "Scan pipeline could not start: $($_.Exception.Message)"
+            & $setStatus 'Scan pipeline could not start. See output above.'
+            & $cleanupScanProcess $false
+            & $setRunningUi $false
+            return
+        }
 
         $timer.Start()
         & $pollProgress

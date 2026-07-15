@@ -213,119 +213,220 @@ $runPreviewFromScan = {
     }
 }.GetNewClosure()
 
-# --- Live filesystem walk (new) ---
-$runPreviewLive = {
-    $scope     = $txtScope.Text.Trim()
-    $sourceSid = $state.Source.Sid
-    $targetSid = $state.Target.Sid
+# Live-walk callbacks are created in the page script's scope so their references
+# to page state and WPF controls remain stable after the worker runspace exits.
+$applyLivePreviewResult = {
+    param($result, $pageContext)
 
-    if (-not (Test-Path -LiteralPath $scope)) {
-        $App.ShowError('Scope not accessible', "Cannot access: $scope")
-        return
-    }
-
-    try { Import-Module NTFSSecurity -ErrorAction Stop }
-    catch {
-        $App.ShowError('NTFSSecurity unavailable', $_.Exception.Message)
-        return
-    }
-
-    $txtPreviewSummary.Text = "Walking $scope for explicit ACEs referencing $($state.Source.Name)…"
-    $grdPreview.ItemsSource = @()
-    $App.SetStatus("Live walk starting…")
-    $Page.Dispatcher.Invoke([Action]{}, 'Background')
-
-    $found        = New-Object System.Collections.ArrayList
-    $folderCount  = 0
-    $errorCount   = 0
-    $skipReparse  = [bool]$chkSkipReparse.IsChecked
-
-    $queue = [System.Collections.Generic.Queue[string]]::new()
-    $queue.Enqueue($scope)
-
-    while ($queue.Count -gt 0) {
-        $current = $queue.Dequeue()
-        $folderCount++
-
-        $isReparse = $false
-        try {
-            $attr = (Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes
-            $isReparse = [bool]($attr -band [System.IO.FileAttributes]::ReparsePoint)
-        } catch { }
-
-        if (-not ($skipReparse -and $isReparse)) {
-            try {
-                $aces = Get-NTFSAccess -Path $current -ExcludeInherited:$true -ErrorAction Stop
-                $matching = @($aces | Where-Object { (& $getAceSid $_) -eq $sourceSid })
-                if ($matching.Count -gt 0) {
-                    $inhStr = 'Y'
-                    try {
-                        $inh = Get-NTFSInheritance -Path $current -ErrorAction Stop
-                        if (-not $inh.AccessInheritanceEnabled) { $inhStr = 'N' }
-                    } catch { }
-
-                    
-                    $rightsSummary = ($matching |
-                        ForEach-Object { "$($_.AccessControlType) $($_.AccessRights)" }) -join '; '
-
-                    [void]$found.Add([pscustomobject]@{
-                        FolderId = $null
-                        Path     = $current
-                        Inh      = $inhStr
-                        AceCount = $matching.Count
-                        SourceRights = $rightsSummary
-                    })
-                }
-            } catch {
-                $errorCount++
-            }
-        }
-
-        if (-not ($skipReparse -and $isReparse)) {
-            try {
-                Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction Stop |
-                    ForEach-Object { $queue.Enqueue($_.FullName) }
-            } catch {
-                $errorCount++
-            }
-        }
-
-        # Pump the UI every 25 folders so the operator sees progress
-        if (($folderCount % 25) -eq 0) {
-            $App.SetStatus("Live walk: $folderCount folder(s) scanned, $($found.Count) hit(s), $errorCount error(s)")
-            $Page.Dispatcher.Invoke([Action]{}, 'Background')
-        }
-    }
-
-    if ($found.Count -eq 0) {
-        $txtPreviewSummary.Text = "Live walk of $scope (scanned $folderCount folder(s)): no explicit ACEs reference $($state.Source.Name). $errorCount enumeration error(s)."
+    if (-not $result.Success) {
+        $state.PreviewRows = @()
         $grdPreview.ItemsSource = @()
         & $invalidatePreview
-        $App.SetStatus("Live walk: 0 affected folders")
+        $txtPreviewSummary.Text = "Live walk failed: $($result.Error)"
+        $App.SetStatus('Live walk failed.')
+        $App.ShowError([string]$result.Title, [string]$result.Error)
         return
     }
 
-    $state.PreviewRows   = @($found)
+    $scopeSnapshot = [string]$result.Scope
+    $sourceNameSnapshot = [string]$result.SourceName
+    $found = @($result.Rows | Where-Object { $null -ne $_ })
+    $folderCount = [int]$result.FoldersWalked
+    $errorCount = [int]$result.ErrorCount
+
+    if ($found.Count -eq 0) {
+        $state.PreviewRows = @()
+        $txtPreviewSummary.Text = "Live walk of $scopeSnapshot (scanned $folderCount folder(s)): no explicit ACEs reference $sourceNameSnapshot. $errorCount enumeration error(s)."
+        $grdPreview.ItemsSource = @()
+        & $invalidatePreview
+        $App.SetStatus('Live walk: 0 affected folders')
+        return
+    }
+
+    $state.PreviewRows   = $found
     $state.PreviewHash   = & $computeInputHash
     $state.DiscoveryMode = 'live'
 
-    $grdPreview.ItemsSource = @($found)
+    $grdPreview.ItemsSource = $found
     $totalAces = ($found | Measure-Object AceCount -Sum).Sum
     $txtPreviewSummary.Text =
-        "Live walk of $scope (scanned $folderCount folder(s)): found $($found.Count) folder(s) with explicit ACEs " +
-        "for $($state.Source.Name). Would affect $totalAces ACE(s). $errorCount enumeration error(s)."
-    $txtPreviewStatus.Text = "Preview ready (live) · type APPLY to enable Execute"
+        "Live walk of $scopeSnapshot (scanned $folderCount folder(s)): found $($found.Count) folder(s) with explicit ACEs " +
+        "for $sourceNameSnapshot. Would affect $totalAces ACE(s). $errorCount enumeration error(s)."
+    $txtPreviewStatus.Text = 'Preview ready (live) · type APPLY to enable Execute'
     $btnExecute.IsEnabled = $false
     $App.SetStatus("Preview (live): $($found.Count) folders, $totalAces ACEs, $errorCount error(s)")
 
     & $writeAudit @{
         event = 'preview'; mode = 'live'
-        sourceSid = $sourceSid; sourceName = $state.Source.Name
-        targetSid = $targetSid; targetName = $state.Target.Name
-        scope = $scope; foldersWalked = $folderCount
+        sourceSid = [string]$result.SourceSid; sourceName = $sourceNameSnapshot
+        targetSid = [string]$result.TargetSid; targetName = [string]$result.TargetName
+        scope = $scopeSnapshot; foldersWalked = $folderCount
         folderCount = $found.Count; aceCount = $totalAces
         errors = $errorCount; inputHash = $state.PreviewHash
     }
+}.GetNewClosure()
+
+$reportLivePreviewProgress = {
+    param($progress, $pageContext)
+
+    $status = "Live walk: $($progress.Folders) folder(s) scanned, $($progress.Hits) hit(s), $($progress.Errors) error(s)"
+    $App.SetStatus($status)
+    if ($null -ne $App.BusyText) { $App.BusyText.Text = $status }
+    $txtPreviewSummary.Text = "$status`nCurrent: $($progress.Path)"
+}.GetNewClosure()
+
+# --- Live filesystem walk ---
+$runPreviewLive = {
+    $scope     = $txtScope.Text.Trim()
+    $sourceSid = $state.Source.Sid
+    $targetSid = $state.Target.Sid
+
+    $txtPreviewSummary.Text = "Walking $scope for explicit ACEs referencing $($state.Source.Name)…"
+    $grdPreview.ItemsSource = @()
+    $state.PreviewRows = @()
+    & $invalidatePreview
+    $txtPreviewStatus.Text = 'Live walk running…'
+    $App.SetStatus('Live walk starting…')
+
+    $skipReparse  = [bool]$chkSkipReparse.IsChecked
+
+    [void]$App.StartAsync(
+        $Page.Tag,
+        'SwapLivePreview',
+        "Walking $scope…",
+        @{
+            Scope      = $scope
+            SourceSid  = [string]$sourceSid
+            SourceName = [string]$state.Source.Name
+            TargetSid  = [string]$targetSid
+            TargetName = [string]$state.Target.Name
+            SkipReparse = $skipReparse
+        },
+        {
+            param($Ctx)
+
+            try {
+                Import-Module NTFSSecurity -ErrorAction Stop
+            } catch {
+                return [pscustomobject]@{
+                    Success = $false
+                    Title   = 'NTFSSecurity unavailable'
+                    Error   = $_.Exception.Message
+                }
+            }
+
+            if (-not (Test-Path -LiteralPath $Ctx.Scope)) {
+                return [pscustomobject]@{
+                    Success = $false
+                    Title   = 'Scope not accessible'
+                    Error   = "Cannot access: $($Ctx.Scope)"
+                }
+            }
+
+            $getSid = {
+                param($Ace)
+
+                try {
+                    if ($Ace.Account -and $Ace.Account.Sid -and $Ace.Account.Sid.Value) {
+                        return [string]$Ace.Account.Sid.Value
+                    }
+                } catch { }
+
+                $name = $null
+                try { $name = [string]$Ace.Account.AccountName } catch { }
+                if (-not $name) { try { $name = [string]$Ace.Account } catch { } }
+                if ($name -match '^S-1-\d+(-\d+)+$') { return $name }
+
+                if ($name) {
+                    try {
+                        $nt = [System.Security.Principal.NTAccount]::new($name)
+                        $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
+                        return [string]$sid.Value
+                    } catch { }
+                }
+                return $null
+            }
+
+            $found = [System.Collections.Generic.List[object]]::new()
+            $folderCount = 0
+            $errorCount = 0
+            $queue = [System.Collections.Generic.Queue[string]]::new()
+            $queue.Enqueue([string]$Ctx.Scope)
+
+            while ($queue.Count -gt 0) {
+                $current = $queue.Dequeue()
+                $folderCount++
+
+                $isReparse = $false
+                try {
+                    $attr = (Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes
+                    $isReparse = [bool]($attr -band [System.IO.FileAttributes]::ReparsePoint)
+                } catch { }
+
+                if (-not ($Ctx.SkipReparse -and $isReparse)) {
+                    try {
+                        $aces = Get-NTFSAccess -Path $current -ExcludeInherited:$true -ErrorAction Stop
+                        $matching = @($aces | Where-Object { (& $getSid $_) -eq $Ctx.SourceSid })
+                        if ($matching.Count -gt 0) {
+                            $inheritance = 'Y'
+                            try {
+                                $inheritanceInfo = Get-NTFSInheritance -Path $current -ErrorAction Stop
+                                if (-not $inheritanceInfo.AccessInheritanceEnabled) { $inheritance = 'N' }
+                            } catch { }
+
+                            $rightsSummary = ($matching | ForEach-Object {
+                                "$($_.AccessControlType) $($_.AccessRights)"
+                            }) -join '; '
+
+                            $found.Add([pscustomobject]@{
+                                FolderId    = $null
+                                Path        = $current
+                                Inh         = $inheritance
+                                AceCount    = $matching.Count
+                                SourceRights = $rightsSummary
+                            })
+                        }
+                    } catch {
+                        $errorCount++
+                    }
+
+                    try {
+                        Get-ChildItem -LiteralPath $current -Directory -Force -ErrorAction Stop |
+                            ForEach-Object { $queue.Enqueue($_.FullName) }
+                    } catch {
+                        $errorCount++
+                    }
+                }
+
+                if (($folderCount % 25) -eq 0) {
+                    $progressQueue = $Ctx['ProgressQueue']
+                    if ($null -ne $progressQueue) {
+                        [void]$progressQueue.Enqueue([pscustomobject]@{
+                            Folders = $folderCount
+                            Hits    = $found.Count
+                            Errors  = $errorCount
+                            Path    = $current
+                        })
+                    }
+                }
+            }
+
+            [pscustomobject]@{
+                Success       = $true
+                Scope         = [string]$Ctx.Scope
+                SourceSid     = [string]$Ctx.SourceSid
+                SourceName    = [string]$Ctx.SourceName
+                TargetSid     = [string]$Ctx.TargetSid
+                TargetName    = [string]$Ctx.TargetName
+                Rows          = @($found)
+                FoldersWalked = $folderCount
+                ErrorCount    = $errorCount
+            }
+        },
+        $applyLivePreviewResult,
+        'Live walk failed',
+        $reportLivePreviewProgress
+    )
 }.GetNewClosure()
 
 # --- Dispatcher: chooses the right discovery mode ---
@@ -688,6 +789,7 @@ $rbModeLive.Add_Click({ & $invalidatePreview }.GetNewClosure())
 
 # Release grid data when the page is unloaded (Frame.Content swap or window close)
 $Page.Add_Unloaded({
+    try { $App.CancelAsync($Page.Tag, 'SwapLivePreview') } catch { }
     try { $grdPreview.ItemsSource = $null } catch { }
     try { $grdExecute.ItemsSource = $null } catch { }
     try { $grdVerify.ItemsSource  = $null } catch { }

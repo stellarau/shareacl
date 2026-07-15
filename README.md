@@ -1,6 +1,6 @@
 # ShareACL
 
-ShareACL is a Windows PowerShell 7 tool for auditing NTFS permissions at scale. It captures folder ACLs in a portable SQLite database, resolves Active Directory identities and group membership, and provides focused views for investigation and controlled ACL substitutions.
+ShareACL is a PowerShell 7 application for Windows that audits NTFS permissions at scale. It captures folder ACLs in a portable SQLite database, resolves Active Directory identities and group membership, and provides focused views for investigation and controlled ACL substitutions.
 
 **[Quick start](#quick-start)** · **[Features](#features)** · **[Operations guide](#operations-guide)** · **[Safety](#operational-safety)**
 
@@ -94,6 +94,8 @@ New scans report progress in two phases:
 
 Use **Run resolver…** to resolve outstanding principals and group memberships for the current scan or the whole database without running another collection.
 
+While resolution is running, the GUI reports the current phase and item, elapsed time, recent activity, and the child process ID. If progress stops for an extended period, the status changes to indicate that the process is still alive but may be waiting on Active Directory, the database, or may have stalled.
+
 Folder, Account, and Findings queries load in the background; ShareACL shows a busy overlay while results are being retrieved.
 
 ### Folder view
@@ -147,6 +149,8 @@ When a GUI operation reports an error, **Recent errors (n)** appears in the stat
 ### ACL Swap
 
 ACL Swap replaces explicit ACEs for one principal with equivalent ACEs for another principal. A database is always required so the operation can be recorded, even when discovery uses the live filesystem.
+
+Live-walk discovery runs in the background and reports folders scanned, matches, and enumeration errors while the application remains responsive.
 
 1. Open **ACL Swap** and choose a source principal, target principal, and scope.
 2. Use **Scan** mode when a suitable scan is loaded; use **Live walk** only when needed.
@@ -234,7 +238,9 @@ Prefer **Scan** mode. **Live walk** reads the filesystem directly and can be slo
 
 ## Project status
 
-ShareACL v1.0-RC1 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/stellarau/shareacl/issues) for planned work.
+ShareACL v1.0-RC2 is focused on safe permission discovery, investigation, and controlled substitution. See the [CHANGELOG](CHANGELOG) for release detail and [Issues](https://github.com/stellarau/shareacl/issues) for planned work.
+
+The release identifier is maintained in the repository-level [VERSION](VERSION) file. The GUI reads this single source of truth and includes it in the main window title automatically.
 
 The tool comes with no support and is distributed AS-IS. No liability for damage caused by using or misusing the tool is accepted by Stellar Systems or any of the contributors.
 
